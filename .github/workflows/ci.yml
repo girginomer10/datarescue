@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install Python dependencies
+        run: uv sync --all-extras --locked
+
+      - name: Install frontend dependencies
+        run: npm --prefix apps/web ci
+
+      - name: Python lint and types
+        run: |
+          uv run ruff check .
+          uv run mypy apps packages
+
+      - name: Backend tests
+        run: uv run pytest
+
+      - name: Verify recorded replay evidence
+        run: python scripts/verify-replay.py
+
+      - name: Frontend tests and build
+        run: |
+          npm --prefix apps/web test
+          npm --prefix apps/web run build
+
+  postgres-dbt-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Install Python dependencies
+        run: uv sync --all-extras --locked
+
+      - name: Prove both candidates against PostgreSQL
+        run: make test-demo

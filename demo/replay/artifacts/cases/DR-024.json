@@ -1,0 +1,56 @@
+{
+  "artifact_type": "recorded_case_snapshot",
+  "schema_version": 1,
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "captured_at": "2026-07-22T13:01:15Z",
+    "producer": "DataRescue deterministic replay",
+    "statement": "This snapshot stops before external writes; integrations below are authoritative."
+  },
+  "id": "DR-024",
+  "asset_urn": "urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)",
+  "state": "PATCH_READY",
+  "incident": {
+    "local_status": "ACTIVE",
+    "datahub_graphql_status": "NOT_RUN",
+    "resolution_status": "NOT_RUN"
+  },
+  "context": {
+    "status": "RECORDED_REPLAY",
+    "artifact": "artifact://replay/artifacts/context-bundle.json"
+  },
+  "candidate_generation": {
+    "status": "RECORDED_REPLAY",
+    "openai_responses_status": "NOT_RUN"
+  },
+  "candidates": [
+    {
+      "source_field": "gross_amount",
+      "outcome": "REJECTED",
+      "reconciliation": "artifact://replay/artifacts/reconciliation/gross_amount.json",
+      "dbt": "artifact://replay/artifacts/dbt/gross_amount.json"
+    },
+    {
+      "source_field": "net_amount",
+      "outcome": "SELECTED",
+      "reconciliation": "artifact://replay/artifacts/reconciliation/net_amount.json",
+      "dbt": "artifact://replay/artifacts/dbt/net_amount.json"
+    }
+  ],
+  "selected_candidate": "net_amount",
+  "patch": {
+    "status": "RECORDED_REPLAY",
+    "path": "demo/dbt/models/staging/stg_payments.sql",
+    "mapping": "net_amount AS revenue"
+  },
+  "pull_request": {
+    "status": "NOT_RUN",
+    "url": null,
+    "message": "No GitHub credential was used while recording this package."
+  },
+  "deployment": {
+    "status": "NOT_RUN",
+    "post_deploy_verification": "NOT_RUN"
+  },
+  "evidence_bundle": "artifact://replay/artifacts/evidence/DR-024.json"
+}

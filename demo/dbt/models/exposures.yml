@@ -1,0 +1,16 @@
+version: 2
+
+exposures:
+  - name: finance_executive_dashboard
+    label: Finance Executive Dashboard
+    type: dashboard
+    maturity: high
+    url: https://example.invalid/datarescue/finance-executive-dashboard
+    description: >-
+      Demo-only downstream consumer whose daily recognized-revenue total must
+      not silently include processing fees.
+    depends_on:
+      - ref('fct_revenue')
+    owner:
+      name: Finance Data
+      email: finance-data@example.invalid

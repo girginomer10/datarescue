@@ -1,0 +1,36 @@
+version: 2
+
+sources:
+  - name: payments_source
+    description: >-
+      Pinch payment events. During the demo, amount is replaced by gross_amount
+      and net_amount to produce a real schemaMetadata change in DataHub.
+    database: "{{ env_var('POSTGRES_DB', 'datarescue') }}"
+    schema: raw
+    tables:
+      - name: payments_raw
+        description: >-
+          Runtime payment source monitored by DataRescue. The legacy amount
+          field represents recognized merchant revenue after processing fees.
+        meta:
+          datarescue:
+            asset_urn: urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)
+            owner_team: Finance Data
+            criticality: high
+        columns:
+          - name: payment_id
+            description: Stable payment primary key.
+          - name: customer_id
+            description: Stable customer identifier.
+          - name: paid_at
+            description: UTC settlement timestamp.
+          - name: currency
+            description: ISO 4217 currency code; the demo fixture uses AUD.
+          - name: status
+            description: Payment lifecycle state.
+          - name: amount
+            description: Legacy merchant net revenue field present before drift.
+          - name: gross_amount
+            description: Customer charge before processing fees; introduced by drift.
+          - name: net_amount
+            description: Merchant proceeds after processing fees; introduced by drift.

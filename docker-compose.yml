@@ -1,0 +1,64 @@
+name: datarescue
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-datarescue}
+      POSTGRES_USER: ${POSTGRES_USER:-datarescue}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datarescue}
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - datarescue_postgres:/var/lib/postgresql/data
+      - ./demo/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # Optional, one-shot ingestion runner. It intentionally expects a supported
+  # DataHub GMS to be running separately (for example, official quickstart).
+  datahub-ingest-postgres:
+    image: ${DATAHUB_INGESTION_IMAGE:-acryldata/datahub-ingestion:v1.6.0}
+    profiles: ["datahub"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-datarescue}
+      POSTGRES_USER: ${POSTGRES_USER:-datarescue}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datarescue}
+      DATAHUB_GMS_URL: ${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:8080}
+      DATAHUB_TOKEN: ${DATAHUB_TOKEN:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./demo/datahub:/recipes:ro
+    command: ["ingest", "run", "-c", "/recipes/postgres-ingestion.yml"]
+    restart: "no"
+
+  # Optional dbt metadata runner. Generate target artifacts first with
+  # `make dbt-artifacts`, then invoke this service through the Makefile.
+  datahub-ingest-dbt:
+    image: ${DATAHUB_INGESTION_IMAGE:-acryldata/datahub-ingestion:v1.6.0}
+    profiles: ["datahub"]
+    environment:
+      DATAHUB_GMS_URL: ${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:8080}
+      DATAHUB_TOKEN: ${DATAHUB_TOKEN:-}
+      DBT_ARTIFACT_ROOT: /workspace/demo/dbt/target
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./:/workspace:ro
+    command: ["ingest", "run", "-c", "/workspace/demo/datahub/dbt-ingestion.yml"]
+    restart: "no"
+
+volumes:
+  datarescue_postgres:

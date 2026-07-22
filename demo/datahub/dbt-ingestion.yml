@@ -1,0 +1,21 @@
+source:
+  type: dbt
+  config:
+    manifest_path: "${DBT_ARTIFACT_ROOT}/manifest.json"
+    catalog_path: "${DBT_ARTIFACT_ROOT}/catalog.json"
+    run_results_paths:
+      - "${DBT_ARTIFACT_ROOT}/run_results.json"
+    target_platform: postgres
+    target_platform_instance: datarescue-demo
+    env: PROD
+    convert_urns_to_lowercase: true
+    include_database_name: true
+    load_schemas: true
+    use_identifiers: false
+    write_semantics: PATCH
+
+sink:
+  type: datahub-rest
+  config:
+    server: "${DATAHUB_GMS_URL}"
+    token: "${DATAHUB_TOKEN}"

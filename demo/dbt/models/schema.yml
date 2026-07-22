@@ -1,0 +1,42 @@
+version: 2
+
+models:
+  - name: stg_payments
+    description: >-
+      Normalizes the monitored payment source and maps exactly one allowlisted
+      source field to the recognized-revenue contract.
+    columns:
+      - name: payment_id
+        description: Stable payment primary key.
+        data_tests:
+          - not_null
+          - unique
+      - name: customer_id
+        description: Stable customer identifier.
+        data_tests:
+          - not_null
+      - name: currency
+        description: ISO 4217 currency code.
+        data_tests:
+          - accepted_values:
+              values: ["AUD"]
+      - name: revenue
+        description: Candidate recognized revenue in AUD.
+        data_tests:
+          - not_null
+
+  - name: fct_revenue
+    description: >-
+      Payment-grain recognized revenue consumed by the Finance Executive
+      dashboard. A candidate can compile and pass these structural tests while
+      still failing DataRescue's reconciliation policy.
+    columns:
+      - name: payment_id
+        description: Stable payment primary key.
+        data_tests:
+          - not_null
+          - unique
+      - name: revenue
+        description: Recognized merchant revenue after processing fees.
+        data_tests:
+          - not_null

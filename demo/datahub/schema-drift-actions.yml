@@ -1,0 +1,39 @@
+name: datarescue-schema-drift
+enabled: true
+
+# DataHub Core v1.6 Quickstart exposes these endpoints on the host by default.
+# The connected runner exports explicit values and never attempts to guess a
+# Docker network or container name.
+source:
+  type: kafka
+  config:
+    connection:
+      bootstrap: ${DATAHUB_KAFKA_BOOTSTRAP}
+      schema_registry_url: ${DATAHUB_SCHEMA_REGISTRY_URL}
+      consumer_config:
+        auto.offset.reset: latest
+        max.poll.interval.ms: 300000
+        security.protocol: PLAINTEXT
+    topic_routes:
+      mcl: ${DATAHUB_MCL_TOPIC:-MetadataChangeLog_Versioned_v1}
+    async_commit_enabled: false
+
+filters:
+  - type: event_type
+    config:
+      filter:
+        MetadataChangeLogEvent_v1:
+          event:
+            - entityType: dataset
+              aspectName: schemaMetadata
+
+action:
+  type: packages.datahub.actions:DataRescueSchemaAction
+  config:
+    api_url: ${DATARESCUE_API_URL}
+    request_timeout_seconds: 240
+
+options:
+  retry_count: 3
+  failure_mode: THROW
+  failed_events_dir: .data/datahub-actions-failures

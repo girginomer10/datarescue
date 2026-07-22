@@ -1,0 +1,58 @@
+{
+  "artifact_type": "policy_evidence_bundle",
+  "schema_version": 1,
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "captured_at": "2026-07-22T13:01:15Z",
+    "producer": "DataRescue deterministic policy engine",
+    "datahub_writeback_status": "NOT_RUN"
+  },
+  "case_id": "DR-024",
+  "decision": "SAFE_PATCH_READY",
+  "selected_candidate": "net_amount",
+  "recovery_claimed": false,
+  "policy": {
+    "semantic_evidence_required": true,
+    "max_total_variance_pct": 0.5,
+    "max_row_count_variance_pct": 0.1,
+    "min_primary_key_overlap_pct": 99.9,
+    "max_null_rate_delta_percentage_points": 0.5,
+    "dbt_build_required": true,
+    "lineage_must_be_current": true
+  },
+  "candidate_ledger": [
+    {
+      "candidate": "gross_amount",
+      "semantic_evidence": "CONFLICT",
+      "total_variance_pct": 3.4,
+      "primary_key_overlap_pct": 100.0,
+      "dbt_tests": "8/8 PASS",
+      "outcome": "REJECTED",
+      "evidence_refs": [
+        "artifact://replay/artifacts/context-bundle.json",
+        "artifact://replay/artifacts/reconciliation/gross_amount.json",
+        "artifact://replay/artifacts/dbt/gross_amount.json"
+      ]
+    },
+    {
+      "candidate": "net_amount",
+      "semantic_evidence": "MATCH",
+      "total_variance_pct": 0.0,
+      "primary_key_overlap_pct": 100.0,
+      "dbt_tests": "8/8 PASS",
+      "outcome": "SELECTED",
+      "evidence_refs": [
+        "artifact://replay/artifacts/context-bundle.json",
+        "artifact://replay/artifacts/reconciliation/net_amount.json",
+        "artifact://replay/artifacts/dbt/net_amount.json"
+      ]
+    }
+  ],
+  "external_operations": {
+    "datahub_incident_create": "NOT_RUN",
+    "datahub_evidence_writeback": "NOT_RUN",
+    "github_draft_pr_create": "NOT_RUN",
+    "deployment": "NOT_RUN",
+    "incident_resolution": "NOT_RUN"
+  }
+}

@@ -1,0 +1,16 @@
+datarescue_demo:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', '127.0.0.1') }}"
+      port: "{{ env_var('POSTGRES_PORT', '55432') | int }}"
+      user: "{{ env_var('POSTGRES_USER', 'datarescue') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'datarescue') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'datarescue') }}"
+      schema: "{{ env_var('DBT_SCHEMA', 'analytics') }}"
+      threads: 2
+      connect_timeout: 10
+      retries: 2
+      keepalives_idle: 0
+      sslmode: disable

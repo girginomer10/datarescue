@@ -1,0 +1,57 @@
+{
+  "artifact_type": "context_bundle",
+  "schema_version": 1,
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "captured_at": "2026-07-22T13:01:15Z",
+    "producer": "DataRescue public demo fixture",
+    "statement": "Reconstructed from repository fixtures; no live metadata call is claimed.",
+    "integrations": {
+      "datahub_mcp": "NOT_RUN",
+      "datahub_graphql": "NOT_RUN",
+      "openai_responses": "NOT_RUN"
+    }
+  },
+  "asset": {
+    "urn": "urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)",
+    "platform": "postgres",
+    "environment": "PROD",
+    "before_fields": [
+      "payment_id",
+      "customer_id",
+      "paid_at",
+      "currency",
+      "status",
+      "amount"
+    ],
+    "after_fields": [
+      "payment_id",
+      "customer_id",
+      "paid_at",
+      "currency",
+      "status",
+      "gross_amount",
+      "net_amount"
+    ]
+  },
+  "semantic_context": {
+    "definition": "Recognized revenue is the net settled amount after processing fees.",
+    "owner": "Finance Data (demo fixture)",
+    "terms": [
+      "urn:li:glossaryTerm:NetRevenue"
+    ],
+    "source_refs": [
+      "demo/postgres/init/00-bootstrap.sql",
+      "demo/dbt/models/schema.yml"
+    ]
+  },
+  "lineage": {
+    "current_within_recording": true,
+    "freshness_basis": "Repository fixture revision captured with this manifest",
+    "urns": [
+      "urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)",
+      "urn:li:dataset:(urn:li:dataPlatform:dbt,datarescue.analytics.stg_payments,PROD)",
+      "urn:li:dataset:(urn:li:dataPlatform:dbt,datarescue.analytics.fct_revenue,PROD)"
+    ]
+  }
+}

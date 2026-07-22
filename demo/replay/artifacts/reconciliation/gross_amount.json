@@ -1,0 +1,35 @@
+{
+  "artifact_type": "candidate_reconciliation",
+  "schema_version": 1,
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "captured_at": "2026-07-22T13:01:15Z",
+    "producer": "PostgreSQL 16 public demo fixture",
+    "source_command": "make dbt-candidates; psql verification query",
+    "source_ref": "demo/postgres/verify_candidates.sql"
+  },
+  "candidate": {
+    "source_field": "gross_amount",
+    "target_alias": "revenue",
+    "expression": "gross_amount AS revenue",
+    "semantic_verdict": "CONFLICT"
+  },
+  "metrics": {
+    "baseline_row_count": 10,
+    "candidate_row_count": 10,
+    "baseline_total_aud": "10000.00",
+    "candidate_total_aud": "10340.00",
+    "total_variance_pct": 3.4,
+    "row_count_variance_pct": 0.0,
+    "primary_key_overlap_pct": 100.0,
+    "null_rate_delta_percentage_points": 0.0
+  },
+  "policy": {
+    "max_total_variance_pct": 0.5,
+    "outcome": "REJECTED",
+    "reasons": [
+      "Total variance 3.40% exceeds the 0.50% limit.",
+      "Gross amount includes processing fees and conflicts with recognized net revenue."
+    ]
+  }
+}

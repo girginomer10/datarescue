@@ -1,0 +1,53 @@
+{
+  "artifact_type": "containment_case",
+  "schema_version": 1,
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "captured_at": "2026-07-22T13:01:15Z",
+    "producer": "DataRescue fail-closed fixture",
+    "statement": "Recorded policy outcome; no external incident or PR operation is claimed."
+  },
+  "id": "DR-025",
+  "asset_urn": "urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)",
+  "scenario": "fail-closed",
+  "state": "CONTAINED",
+  "reason": "No candidate satisfies required semantic and reconciliation gates.",
+  "candidate": {
+    "source_field": "settlement_amount",
+    "target_alias": "revenue",
+    "semantic_verdict": "MISSING",
+    "semantic_evidence": "artifact://replay/artifacts/context-bundle.json",
+    "reconciliation": {
+      "baseline_row_count": 10,
+      "current_row_count": 10,
+      "baseline_total": 10000.0,
+      "candidate_total": 9850.0,
+      "total_variance_pct": -1.5,
+      "row_count_variance_pct": 0.0,
+      "primary_key_overlap_pct": 100.0,
+      "null_rate_delta_percentage_points": 0.0
+    },
+    "dbt": {
+      "status": "PASSED",
+      "tests_passed": 8,
+      "tests_total": 8,
+      "total_nodes_succeeded": 10,
+      "total_nodes": 10,
+      "recorded_at": "2026-07-22T13:14:19Z"
+    },
+    "policy_outcome": "REJECTED",
+    "failed_gates": [
+      "semantic_evidence",
+      "total_variance"
+    ]
+  },
+  "effects": {
+    "incident_local_status": "ACTIVE",
+    "datahub_writeback_status": "NOT_RUN",
+    "github_draft_pr_status": "NOT_RUN",
+    "deployment_status": "NOT_RUN",
+    "guard_contract_exit_code": 75,
+    "downstream_command_must_run": false
+  },
+  "guard_example": "datarescue guard --asset <URN> -- dbt build"
+}

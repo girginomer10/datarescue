@@ -1,0 +1,78 @@
+{
+  "manifest_version": 1,
+  "package_id": "datarescue-public-demo-2026-07-22",
+  "created_at": "2026-07-22T13:01:15Z",
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "statement": "PostgreSQL/dbt evidence recorded from the public fixture; external integrations were not run.",
+    "integrations": {
+      "datahub": "NOT_RUN",
+      "openai": "NOT_RUN",
+      "github": "NOT_RUN",
+      "deployment": "NOT_RUN"
+    }
+  },
+  "hash_algorithm": "sha256",
+  "files": [
+    {
+      "path": "artifacts/cases/DR-024.json",
+      "artifact_type": "recorded_case_snapshot",
+      "bytes": 1789,
+      "sha256": "aa6737adb340103196f44a885623622afdeebac7176e49cd70739b9723364cef"
+    },
+    {
+      "path": "artifacts/containment/DR-025.json",
+      "artifact_type": "containment_case",
+      "bytes": 1713,
+      "sha256": "886a09affe8411d6607c6b88cb41d15061580621b5486dee2e5ebc6dec43ea05"
+    },
+    {
+      "path": "artifacts/context-bundle.json",
+      "artifact_type": "context_bundle",
+      "bytes": 1656,
+      "sha256": "b9fe00a072384eb20706c3129df3d6641732a10ded0c67656d4d907ee4a2b4d6"
+    },
+    {
+      "path": "artifacts/dbt/gross_amount.json",
+      "artifact_type": "dbt_result_summary",
+      "bytes": 911,
+      "sha256": "31fafa3b14c729182dba57a1be0673290d2f3dd6c4a176f6acad89e3738bcb8c"
+    },
+    {
+      "path": "artifacts/dbt/net_amount.json",
+      "artifact_type": "dbt_result_summary",
+      "bytes": 913,
+      "sha256": "9a7056f2be60a4c5f63f35bf72814ca37cd20568d8ad4b69d7211b0ce46be45e"
+    },
+    {
+      "path": "artifacts/evidence/DR-024.json",
+      "artifact_type": "policy_evidence_bundle",
+      "bytes": 1819,
+      "sha256": "dcfec947914cfc35c518491fe0bbc25847b7fd29fab30a46484e5faac0a8da96"
+    },
+    {
+      "path": "artifacts/reconciliation/gross_amount.json",
+      "artifact_type": "candidate_reconciliation",
+      "bytes": 1075,
+      "sha256": "c73d87be861ddd394c995271a605dbca512f74a20c63c041a0e002a68b47a6fc"
+    },
+    {
+      "path": "artifacts/reconciliation/net_amount.json",
+      "artifact_type": "candidate_reconciliation",
+      "bytes": 989,
+      "sha256": "d9fcd605564d9ff977f69664bd2c02f76e7703b33f1e85c94f2c069d98785ea1"
+    }
+  ],
+  "expected_claims": {
+    "gross_total_variance_pct": 3.4,
+    "gross_outcome": "REJECTED",
+    "net_total_variance_pct": 0.0,
+    "net_primary_key_overlap_pct": 100.0,
+    "net_outcome": "SELECTED",
+    "dbt_tests_per_candidate": 8,
+    "github_replay_status": "NOT_RUN",
+    "containment_total_variance_pct": -1.5,
+    "containment_dbt_tests": 8,
+    "guard_exit_code": 75
+  }
+}

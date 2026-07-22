@@ -1,0 +1,30 @@
+source:
+  type: postgres
+  config:
+    host_port: "${POSTGRES_HOST}:${POSTGRES_PORT}"
+    database: "${POSTGRES_DB}"
+    username: "${POSTGRES_USER}"
+    password: "${POSTGRES_PASSWORD}"
+    env: PROD
+    platform_instance: datarescue-demo
+    convert_urns_to_lowercase: true
+    include_tables: true
+    include_views: true
+    include_table_lineage: true
+    include_view_lineage: true
+    schema_pattern:
+      allow:
+        - "^raw$"
+        - "^audit$"
+        - "^analytics$"
+        - "^candidate_.*$"
+    profiling:
+      enabled: true
+      profile_table_level_only: false
+      max_number_of_fields_to_profile: 50
+
+sink:
+  type: datahub-rest
+  config:
+    server: "${DATAHUB_GMS_URL}"
+    token: "${DATAHUB_TOKEN}"

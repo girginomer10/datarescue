@@ -1,0 +1,25 @@
+{
+  "artifact_type": "dbt_result_summary",
+  "schema_version": 1,
+  "provenance": {
+    "status": "RECORDED_REPLAY",
+    "captured_at": "2026-07-22T13:01:00.500910Z",
+    "producer": "dbt-core 1.9.8 and dbt-postgres 1.9.0",
+    "source_artifact": "demo/dbt/target/run_results.json",
+    "raw_artifact_committed": false
+  },
+  "candidate": "gross_amount",
+  "isolated_schema": "candidate_gross",
+  "command": "DATARESCUE_REVENUE_COLUMN=gross_amount DBT_SCHEMA=candidate_gross dbt build --project-dir demo/dbt --profiles-dir demo/dbt",
+  "invocation_id": "b0ec7c32-47e9-4302-a9eb-f3691b0de8de",
+  "elapsed_seconds": 0.29381704330444336,
+  "result": {
+    "status": "PASSED",
+    "models_successful": 2,
+    "models_total": 2,
+    "tests_passed": 8,
+    "tests_failed": 0,
+    "tests_total": 8
+  },
+  "interpretation": "Compilation and tests passed, but this does not satisfy reconciliation or semantic policy."
+}
