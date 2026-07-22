@@ -46,6 +46,15 @@ from packages.remediation.github import (
 from packages.remediation.sql_safety import render_dbt_patch
 
 DEFAULT_ASSET_URN = CANONICAL_ASSET_URN
+_INGEST_RESUMABLE_STATES = frozenset(
+    {
+        CaseState.DETECTED,
+        CaseState.CONTEXT_GATHERED,
+        CaseState.CANDIDATES_READY,
+        CaseState.VALIDATING,
+        CaseState.PATCH_READY,
+    }
+)
 
 
 class AssetNotAllowedError(PermissionError):
@@ -78,13 +87,21 @@ class WorkflowService:
         # concurrently, but only one evidence-producing workflow can touch dbt,
         # PostgreSQL candidate schemas, or git worktrees at a time.
         self._worker_lock = threading.Lock()
+        # Duplicate MCL delivery should stay fast while this process is already
+        # advancing the same case, but an empty set after restart is the signal
+        # to resume a durable non-terminal checkpoint under ``_worker_lock``.
+        self._active_cases_lock = threading.Lock()
+        self._active_cases: set[str] = set()
+        self._settled_cases: set[str] = set()
         self.store = store or EventStore(settings.resolved_database_path)
         self.policy = policy or PolicyEngine()
         self.mcp = mcp or DataHubMCPAdapter(
             endpoint=settings.datahub_mcp_url,
-            token=settings.datahub_token,
+            token=settings.datahub_mcp_token,
             context_tool=settings.datahub_mcp_context_tool,
             write_tool=settings.datahub_mcp_write_tool,
+            gms_url=settings.datahub_gms_url,
+            gms_token=settings.datahub_token,
         )
         self.incidents = incidents or DataHubGraphQLAdapter(
             gms_url=settings.datahub_gms_url, token=settings.datahub_token
@@ -117,7 +134,10 @@ class WorkflowService:
         existing = self.store.find_case_for_dedup(dedup_key)
         if existing:
             duplicate = self._deduplicated_response(event, dedup_key, existing)
-            if duplicate is not None:
+            if duplicate is not None and (
+                duplicate.case.state not in _INGEST_RESUMABLE_STATES
+                or self._case_is_owned_by_process(existing)
+            ):
                 return duplicate
         # v1 serializes the entire case-creation flow. The initial detection
         # event and every _advance append must be atomic with respect to a demo
@@ -128,7 +148,14 @@ class WorkflowService:
             if existing:
                 duplicate = self._deduplicated_response(event, dedup_key, existing)
                 if duplicate is not None:
-                    return duplicate
+                    if (
+                        duplicate.case.state in _INGEST_RESUMABLE_STATES
+                        and not self._case_is_owned_by_process(existing)
+                    ):
+                        self._advance_safely_locked(case_id=existing, event=event)
+                    return SchemaChangeResponse(
+                        case=self.store.get_case(existing), deduplicated=True
+                    )
 
             # Keep the established short canonical ID in the common case, then
             # deterministically widen the digest if that display ID is already
@@ -170,29 +197,48 @@ class WorkflowService:
                     # availability read. Re-read and widen instead of conflating
                     # the two drifts.
                     case_id = self._available_case_id(dedup_key)
-            try:
-                self._advance(case_id=case_id, event=event)
-            except Exception as error:  # durable failure without leaking configuration
-                current = self.store.get_case(case_id)
-                if current.state not in {
-                    CaseState.RESOLVED,
-                    CaseState.CONTAINED,
-                    CaseState.FAILED,
-                }:
-                    self.store.append(
-                        case_id=case_id,
-                        event_type=EventType.FAILED,
-                        state=CaseState.FAILED,
-                        payload={
-                            "error_type": type(error).__name__,
-                            "message": (
-                                "Workflow execution failed; inspect server logs for details"
-                            ),
-                        },
-                    )
+            self._advance_safely_locked(case_id=case_id, event=event)
             return SchemaChangeResponse(
                 case=self.store.get_case(case_id), deduplicated=False
             )
+
+    def _case_is_owned_by_process(self, case_id: str) -> bool:
+        with self._active_cases_lock:
+            return case_id in self._active_cases or case_id in self._settled_cases
+
+    def _advance_safely_locked(
+        self, *, case_id: str, event: SchemaChangeEvent
+    ) -> None:
+        with self._active_cases_lock:
+            self._active_cases.add(case_id)
+        completed = False
+        try:
+            self._advance(case_id=case_id, event=event)
+            completed = True
+        except Exception as error:  # durable failure without leaking configuration
+            current = self.store.get_case(case_id)
+            if current.state not in {
+                CaseState.RESOLVED,
+                CaseState.CONTAINED,
+                CaseState.FAILED,
+            }:
+                self.store.append(
+                    case_id=case_id,
+                    event_type=EventType.FAILED,
+                    state=CaseState.FAILED,
+                    payload={
+                        "error_type": type(error).__name__,
+                        "message": (
+                            "Workflow execution failed; inspect server logs for details"
+                        ),
+                    },
+                )
+            completed = True
+        finally:
+            with self._active_cases_lock:
+                self._active_cases.discard(case_id)
+                if completed:
+                    self._settled_cases.add(case_id)
 
     def _deduplicated_response(
         self, event: SchemaChangeEvent, dedup_key: str, case_id: str
@@ -236,69 +282,115 @@ class WorkflowService:
             return self.store.reset(reason)
 
     def _advance(self, *, case_id: str, event: SchemaChangeEvent) -> None:
-        incident_result = self.incidents.raise_incident(
-            asset_urn=event.entity_urn,
-            case_id=case_id,
-            description=(
-                "Schema drift detected. DataRescue is gathering evidence; no repair has shipped."
-            ),
-        )
-        self.store.append(
-            case_id=case_id,
-            event_type=EventType.INCIDENT_RAISED,
-            state=CaseState.DETECTED,
-            payload={"integration": incident_result.model_dump(mode="json")},
-        )
+        case = self.store.get_case(case_id)
+        if case.state not in _INGEST_RESUMABLE_STATES:
+            return
+
+        incident_result = case.incident_integration
+        if incident_result is None:
+            incident_result = self.incidents.raise_incident(
+                asset_urn=event.entity_urn,
+                case_id=case_id,
+                description=(
+                    "Schema drift detected. DataRescue is gathering evidence; "
+                    "no repair has shipped."
+                ),
+            )
+            self.store.append(
+                case_id=case_id,
+                event_type=EventType.INCIDENT_RAISED,
+                state=CaseState.DETECTED,
+                payload={"integration": incident_result.model_dump(mode="json")},
+            )
         if not self._connected_integration_ready(
             case_id, incident_result, "DataHub incident creation"
         ):
             return
 
-        context = self._context(event.entity_urn)
-        if not context.glossary_definition or not context.lineage_current:
+        case = self.store.get_case(case_id)
+        context = case.context
+        if context is None:
+            context = self._context(event.entity_urn)
+            if not context.glossary_definition or not context.lineage_current:
+                self._contain(
+                    case_id,
+                    event.entity_urn,
+                    ["Required semantic context or current lineage is unavailable"],
+                )
+                return
+            self.store.append(
+                case_id=case_id,
+                event_type=EventType.CONTEXT_GATHERED,
+                state=CaseState.CONTEXT_GATHERED,
+                payload={"context": context.model_dump(mode="json")},
+            )
+        elif not context.glossary_definition or not context.lineage_current:
             self._contain(
                 case_id,
                 event.entity_urn,
-                ["Required semantic context or current lineage is unavailable"],
+                ["Persisted semantic context or lineage is incomplete"],
             )
             return
-        self.store.append(
-            case_id=case_id,
-            event_type=EventType.CONTEXT_GATHERED,
-            state=CaseState.CONTEXT_GATHERED,
-            payload={"context": context.model_dump(mode="json")},
-        )
 
-        generated = self.candidates.propose(event, context)
-        if not self._connected_integration_ready(
-            case_id, generated.integration, "OpenAI candidate generation"
+        case = self.store.get_case(case_id)
+        proposals = case.candidate_proposals
+        generation_integration = case.candidate_generation
+        if generation_integration is None or not proposals:
+            generated = self.candidates.propose(event, context)
+            if not self._connected_integration_ready(
+                case_id, generated.integration, "OpenAI candidate generation"
+            ):
+                return
+            if not generated.candidates:
+                self._contain(
+                    case_id, event.entity_urn, ["No schema-compatible candidate exists"]
+                )
+                return
+            proposals = generated.candidates
+            generation_integration = generated.integration
+            self.store.append(
+                case_id=case_id,
+                event_type=EventType.CANDIDATES_READY,
+                state=CaseState.CANDIDATES_READY,
+                payload={
+                    "candidates": [item.model_dump(mode="json") for item in proposals],
+                    "generation_integration": generation_integration.model_dump(
+                        mode="json"
+                    ),
+                },
+            )
+        elif not self._connected_integration_ready(
+            case_id, generation_integration, "OpenAI candidate generation"
         ):
             return
-        if not generated.candidates:
-            self._contain(case_id, event.entity_urn, ["No schema-compatible candidate exists"])
-            return
-        self.store.append(
-            case_id=case_id,
-            event_type=EventType.CANDIDATES_READY,
-            state=CaseState.CANDIDATES_READY,
-            payload={
-                "candidates": [item.model_dump(mode="json") for item in generated.candidates],
-                "generation_integration": generated.integration.model_dump(mode="json"),
-            },
-        )
-        self.store.append(
-            case_id=case_id,
-            event_type=EventType.VALIDATION_STARTED,
-            state=CaseState.VALIDATING,
-            payload={
-                "candidate_count": len(generated.candidates),
-                "execution_mode": self.settings.execution_mode,
-            },
-        )
 
-        assessments: list[CandidateAssessment] = []
+        if len({proposal.id for proposal in proposals}) != len(proposals):
+            raise ValueError("Candidate proposal ids must be unique")
+
+        case = self.store.get_case(case_id)
+        if case.state is CaseState.CANDIDATES_READY:
+            self.store.append(
+                case_id=case_id,
+                event_type=EventType.VALIDATION_STARTED,
+                state=CaseState.VALIDATING,
+                payload={
+                    "candidate_count": len(proposals),
+                    "execution_mode": self.settings.execution_mode,
+                },
+            )
+
+        case = self.store.get_case(case_id)
+        assessments_by_id = {assessment.id: assessment for assessment in case.candidates}
         rejection_reasons: list[str] = []
-        for proposal in generated.candidates:
+        for proposal in proposals:
+            existing_assessment = assessments_by_id.get(proposal.id)
+            if existing_assessment is not None:
+                rejection_reasons.extend(
+                    f"{proposal.source_field}: {check.name}"
+                    for check in existing_assessment.policy_checks
+                    if not check.passed
+                )
+                continue
             try:
                 execution = self.executor.execute(
                     case_id=case_id, proposal=proposal, context=context
@@ -323,7 +415,7 @@ class WorkflowService:
                 policy_checks=decision.checks,
                 outcome=self.policy.outcome(decision),
             )
-            assessments.append(assessment)
+            assessments_by_id[assessment.id] = assessment
             rejection_reasons.extend(
                 f"{proposal.source_field}: {reason}" for reason in decision.reasons
             )
@@ -334,57 +426,87 @@ class WorkflowService:
                 payload={"assessment": assessment.model_dump(mode="json")},
             )
 
-        eligible = [item for item in assessments if item.outcome is CandidateOutcome.ELIGIBLE]
+        assessments = [assessments_by_id[proposal.id] for proposal in proposals]
+        eligible = [
+            item
+            for item in assessments
+            if item.outcome in {CandidateOutcome.ELIGIBLE, CandidateOutcome.SELECTED}
+        ]
         if not eligible:
             self._contain(case_id, event.entity_urn, rejection_reasons)
             return
-        selected = min(
-            eligible,
-            key=lambda item: (
-                abs(item.reconciliation.total_variance_pct),
-                abs(item.reconciliation.row_count_variance_pct),
-                item.source_field,
-            ),
-        ).model_copy(update={"outcome": CandidateOutcome.SELECTED})
-        proposal = next(item for item in generated.candidates if item.id == selected.id)
-        patch_path = self.settings.github_repo_root / self.settings.github_patch_path
-        patch_content = render_dbt_patch(
-            proposal, existing_sql=patch_path.read_text(encoding="utf-8")
-        )
-        patch = PatchArtifact(
-            path=self.settings.github_patch_path,
-            content=patch_content,
-            sha256=hashlib.sha256(patch_content.encode()).hexdigest(),
-        )
-        self.store.append(
-            case_id=case_id,
-            event_type=EventType.PATCH_READY,
-            state=CaseState.PATCH_READY,
-            payload={
-                "selected_candidate": selected.model_dump(mode="json"),
-                "patch": patch.model_dump(mode="json"),
-            },
-        )
-        writeback = self.mcp.write_evidence_report(
-            asset_urn=event.entity_urn,
-            case_id=case_id,
-            report={
-                "decision": "SAFE_REPAIR_VALIDATED",
-                "selected_candidate": selected.model_dump(mode="json"),
-                "patch_sha256": patch.sha256,
-            },
-            degraded=False,
-        )
-        self.store.append(
-            case_id=case_id,
-            event_type=EventType.EVIDENCE_WRITTEN,
-            state=CaseState.PATCH_READY,
-            payload={"integration": writeback.model_dump(mode="json")},
-        )
+
+        case = self.store.get_case(case_id)
+        selected = case.selected_candidate
+        patch = case.patch
+        if selected is None or patch is None:
+            selected = min(
+                eligible,
+                key=lambda item: (
+                    abs(item.reconciliation.total_variance_pct),
+                    abs(item.reconciliation.row_count_variance_pct),
+                    item.source_field,
+                ),
+            ).model_copy(update={"outcome": CandidateOutcome.SELECTED})
+            proposal = next(item for item in proposals if item.id == selected.id)
+            patch_path = self.settings.github_repo_root / self.settings.github_patch_path
+            patch_content = render_dbt_patch(
+                proposal, existing_sql=patch_path.read_text(encoding="utf-8")
+            )
+            patch = PatchArtifact(
+                path=self.settings.github_patch_path,
+                content=patch_content,
+                sha256=hashlib.sha256(patch_content.encode()).hexdigest(),
+            )
+            self.store.append(
+                case_id=case_id,
+                event_type=EventType.PATCH_READY,
+                state=CaseState.PATCH_READY,
+                payload={
+                    "selected_candidate": selected.model_dump(mode="json"),
+                    "patch": patch.model_dump(mode="json"),
+                },
+            )
+
+        case = self.store.get_case(case_id)
+        writeback = case.evidence_writeback
+        if writeback is None:
+            writeback = self.mcp.write_evidence_report(
+                asset_urn=event.entity_urn,
+                case_id=case_id,
+                report={
+                    "decision": "SAFE_REPAIR_VALIDATED",
+                    "selected_candidate": selected.model_dump(mode="json"),
+                    "patch_sha256": patch.sha256,
+                },
+                degraded=False,
+            )
+            self.store.append(
+                case_id=case_id,
+                event_type=EventType.EVIDENCE_WRITTEN,
+                state=CaseState.PATCH_READY,
+                payload={"integration": writeback.model_dump(mode="json")},
+            )
         if not self._connected_integration_ready(
             case_id, writeback, "DataHub patch evidence write-back"
         ):
             return
+
+        case = self.store.get_case(case_id)
+        pull_request = case.pull_request
+        if (
+            pull_request is not None
+            and pull_request.integration.status is IntegrationStatus.SUCCEEDED
+        ):
+            if case.state is CaseState.PATCH_READY:
+                self.store.append(
+                    case_id=case_id,
+                    event_type=EventType.PR_OPENED,
+                    state=CaseState.PR_OPEN,
+                    payload={"pull_request": pull_request.model_dump(mode="json")},
+                )
+            return
+
         pull_request = self.github.create_draft(case_id=case_id, patch=patch)
         if pull_request.integration.status is IntegrationStatus.SUCCEEDED:
             self.store.append(
@@ -601,18 +723,29 @@ class WorkflowService:
         )
         git("cat-file", "-e", f"{trusted_base_ref}^{{commit}}")
         try:
-            verified_commit = (
+            trusted_base_tip = (
+                git("rev-parse", "--verify", f"{trusted_base_ref}^{{commit}}")
+                .decode("ascii")
+                .strip()
+            )
+            requested_commit = (
                 git("rev-parse", "--verify", f"{commit}^{{commit}}")
                 .decode("ascii")
                 .strip()
             )
         except UnicodeDecodeError as error:
             raise ValueError("Verified commit id is not valid ASCII") from error
-        if len(verified_commit) not in {40, 64} or any(
-            character not in "0123456789abcdefABCDEF" for character in verified_commit
-        ):
-            raise ValueError("Git did not return a canonical full commit id")
-        git("merge-base", "--is-ancestor", verified_commit, trusted_base_ref)
+        for resolved_commit in (trusted_base_tip, requested_commit):
+            if len(resolved_commit) not in {40, 64} or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in resolved_commit
+            ):
+                raise ValueError("Git did not return a canonical full commit id")
+        if requested_commit.casefold() != trusted_base_tip.casefold():
+            raise ValueError(
+                "Merged commit must exactly match the fetched origin/base tip"
+            )
+        verified_commit = trusted_base_tip
 
         stored_patch = case.patch.content.encode("utf-8")
         stored_hash = hashlib.sha256(stored_patch).hexdigest()

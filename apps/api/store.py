@@ -407,6 +407,14 @@ class EventStore:
                 return case
         return None
 
+    def blocked_asset(self, asset_urn: str) -> CaseSnapshot | None:
+        """Return an unresolved case that must block downstream execution."""
+
+        for case in self.list_cases():
+            if case.asset_urn == asset_urn and case.state is not CaseState.RESOLVED:
+                return case
+        return None
+
 
 def _replace_assessment(
     assessments: list[CandidateAssessment], selected: CandidateAssessment

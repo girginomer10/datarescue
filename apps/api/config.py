@@ -38,8 +38,13 @@ class Settings(BaseSettings):
     datahub_gms_url: str | None = None
     datahub_token: str | None = None
     datahub_mcp_url: str | None = None
-    datahub_mcp_context_tool: str = "get_asset_context"
-    datahub_mcp_write_tool: str = "write_document"
+    # MCP authentication is a separate trust boundary. Never reuse the DataHub
+    # GMS bearer token for an externally managed MCP endpoint.
+    datahub_mcp_token: str | None = None
+    # The official DataHub MCP v0.6 context read is composite; this setting is
+    # retained for backwards-compatible configuration diagnostics only.
+    datahub_mcp_context_tool: str = "get_entities"
+    datahub_mcp_write_tool: str = "save_document"
 
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.6-terra"

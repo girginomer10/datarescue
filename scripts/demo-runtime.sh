@@ -15,11 +15,13 @@ readonly POSTGRES_USER="${POSTGRES_USER:-datarescue}"
 readonly POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-datarescue}"
 readonly POSTGRES_PORT="${POSTGRES_PORT:-55432}"
 readonly DATAHUB_INGESTION_IMAGE="${DATAHUB_INGESTION_IMAGE:-acryldata/datahub-ingestion:v1.6.0}"
-readonly DATAHUB_GMS_URL_CONTAINER="${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:8080}"
+readonly DATAHUB_MAPPED_GMS_PORT="${DATAHUB_MAPPED_GMS_PORT:-18080}"
+readonly DATAHUB_GMS_URL_CONTAINER="${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:${DATAHUB_MAPPED_GMS_PORT}}"
 readonly DATAHUB_TOKEN="${DATAHUB_TOKEN:-}"
 readonly DATAHUB_INGEST_DRY_RUN="${DATAHUB_INGEST_DRY_RUN:-0}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dbt_artifact_root_host="${DBT_ARTIFACT_ROOT_HOST:-${repo_root}/demo/dbt/target}"
 docker_config_fallback=""
 
 prepare_docker_client() {
@@ -166,7 +168,19 @@ datahub_ingest_postgres() {
 
 datahub_ingest_dbt() {
   local -a run_options=()
+  local artifact_root
   require_docker
+  [[ -d "${dbt_artifact_root_host}" ]] || {
+    echo "dbt artifact root does not exist: ${dbt_artifact_root_host}" >&2
+    exit 1
+  }
+  artifact_root="$(cd "${dbt_artifact_root_host}" && pwd -P)"
+  for artifact in manifest.json catalog.json run_results.json; do
+    [[ -s "${artifact_root}/${artifact}" ]] || {
+      echo "dbt artifact snapshot is incomplete: ${artifact}" >&2
+      exit 1
+    }
+  done
   if [[ "${DATAHUB_INGEST_DRY_RUN}" == "1" ]]; then
     run_options=(--dry-run --no-default-report)
   fi
@@ -174,9 +188,10 @@ datahub_ingest_dbt() {
     --add-host host.docker.internal:host-gateway \
     --env DATAHUB_GMS_URL="${DATAHUB_GMS_URL_CONTAINER}" \
     --env DATAHUB_TOKEN="${DATAHUB_TOKEN}" \
-    --env DBT_ARTIFACT_ROOT=/workspace/demo/dbt/target \
-    --volume "${repo_root}:/workspace:ro" \
-    "${DATAHUB_INGESTION_IMAGE}" ingest run -c /workspace/demo/datahub/dbt-ingestion.yml "${run_options[@]}"
+    --env DBT_ARTIFACT_ROOT=/artifacts \
+    --volume "${artifact_root}:/artifacts:ro" \
+    --volume "${repo_root}/demo/datahub:/recipes:ro" \
+    "${DATAHUB_INGESTION_IMAGE}" ingest run -c /recipes/dbt-ingestion.yml "${run_options[@]}"
 }
 
 clean_all() {

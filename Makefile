@@ -13,10 +13,26 @@ DATAHUB_RELEASE ?= v$(DATAHUB_VERSION)
 DATAHUB_CLI := $(UVX) --python $(PYTHON_VERSION) --from acryl-datahub==$(DATAHUB_VERSION) datahub
 DATAHUB_ACTIONS_VERSION ?= 1.6.0.15
 DATAHUB_ACTIONS_RECIPE ?= demo/datahub/schema-drift-actions.yml
+DATAHUB_MAPPED_GMS_PORT ?= 18080
+DATAHUB_GMS_URL ?= http://127.0.0.1:$(DATAHUB_MAPPED_GMS_PORT)
+DATAHUB_GMS_URL_CONTAINER ?= http://host.docker.internal:$(DATAHUB_MAPPED_GMS_PORT)
 DATAHUB_KAFKA_BOOTSTRAP ?= 127.0.0.1:9092
-DATAHUB_SCHEMA_REGISTRY_URL ?= http://127.0.0.1:8081
+DATAHUB_SCHEMA_REGISTRY_URL ?= $(DATAHUB_GMS_URL)/schema-registry/api/
 DATAHUB_MCL_TOPIC ?= MetadataChangeLog_Versioned_v1
 DATARESCUE_API_URL ?= http://127.0.0.1:8000
+DATAHUB_MCP_HOST ?= 127.0.0.1
+DATAHUB_MCP_PORT ?= 8001
+DATAHUB_MCP_URL ?= http://$(DATAHUB_MCP_HOST):$(DATAHUB_MCP_PORT)/mcp
+DATAHUB_CONTEXT := $(UV_RUN) --with acryl-datahub==$(DATAHUB_VERSION) -- \
+	python scripts/seed_datahub_context.py
+ifeq ($(strip $(DATAHUB_TOKEN)),)
+DATAHUB_TOKEN := $(DATARESCUE_DATAHUB_TOKEN)
+endif
+ifeq ($(strip $(DATARESCUE_DATAHUB_TOKEN)),)
+DATARESCUE_DATAHUB_TOKEN := $(DATAHUB_TOKEN)
+endif
+export DATAHUB_MAPPED_GMS_PORT DATAHUB_GMS_URL DATAHUB_GMS_URL_CONTAINER
+export DATAHUB_TOKEN DATARESCUE_DATAHUB_TOKEN
 
 POSTGRES_DB ?= datarescue
 POSTGRES_USER ?= datarescue
@@ -31,20 +47,23 @@ DBT_POSTGRES_VERSION ?= 1.9.0
 DBT := $(UV_RUN) --with dbt-core==$(DBT_CORE_VERSION) \
 	--with dbt-postgres==$(DBT_POSTGRES_VERSION) -- dbt
 DBT_FLAGS := --project-dir $(DBT_PROJECT_DIR) --profiles-dir $(DBT_PROJECT_DIR)
+DBT_ARTIFACT_LOCK ?= $(CURDIR)/.data/dbt-artifact-publish.lock
+DBT_ARTIFACT_SNAPSHOT_ROOT ?= $(CURDIR)/.data
 PSQL := $(DEMO_RUNTIME) psql
 
 API_CMD ?= $(UV_RUN) uvicorn apps.api.main:app --reload --host 0.0.0.0 --port 8000
 WEB_CMD ?= $(NPM) --prefix apps/web run dev -- --host 0.0.0.0 --port 5173
-DATAHUB_GMS_URL ?= http://127.0.0.1:8080
 DEMO_POSTGRES_DSN := postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
 
 .PHONY: help install bootstrap api-install web-install postgres-up postgres-down postgres-logs \
 	demo-data-reset demo-drift demo-containment demo-data-verify dbt-debug dbt-build \
 	dbt-build-healthy dbt-candidates-current dbt-candidates dbt-docs dbt-artifacts-current \
-	dbt-artifacts-healthy dbt-artifacts datahub-check datahub-ingest-postgres \
+	dbt-artifacts-selected dbt-artifacts-healthy dbt-artifacts datahub-check datahub-ingest-postgres \
 	datahub-ingest-dbt datahub-ingest datahub-up datahub-down datahub-seed-healthy \
+	datahub-seed-context datahub-verify-context datahub-mcp-start datahub-mcp-stop \
+	datahub-mcp-verify datahub-mcp-proof \
 	datahub-apply-drift datahub-validate datahub-actions-validate datahub-actions-run \
-	demo-ready dev demo demo-replay demo-connected test-demo test lint build check \
+	datahub-mcl-proof demo-ready dev demo demo-replay demo-connected test-demo test lint build check \
 	clean demo-clean memory-init memory-sync memory-reindex memory-search memory-doctor memory-add
 
 help: ## Show available commands.
@@ -92,11 +111,25 @@ dbt-debug: postgres-up ## Validate the dbt/PostgreSQL connection.
 		POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) $(DBT) debug $(DBT_FLAGS)
 
 dbt-build: postgres-up ## Build one candidate (set REVENUE_COLUMN and DBT_SCHEMA).
-	POSTGRES_HOST=$(POSTGRES_HOST) POSTGRES_PORT=$(POSTGRES_PORT) \
-		POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER) \
-		POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
-		DATARESCUE_REVENUE_COLUMN=$${REVENUE_COLUMN:-net_amount} \
-		DBT_SCHEMA=$${DBT_SCHEMA:-analytics} $(DBT) build $(DBT_FLAGS)
+	@set -euo pipefail; \
+		target_path="$${DBT_TARGET_PATH:-}"; \
+		managed_target=false; \
+		if [[ -z "$$target_path" ]]; then \
+			target_path="$$(mktemp -d "$${TMPDIR:-/tmp}/datarescue-dbt-build.XXXXXX")"; \
+			managed_target=true; \
+		else \
+			mkdir -p "$$target_path"; \
+		fi; \
+		cleanup() { \
+			if [[ "$$managed_target" == "true" ]]; then rm -rf -- "$$target_path"; fi; \
+		}; \
+		trap cleanup EXIT INT TERM; \
+		POSTGRES_HOST=$(POSTGRES_HOST) POSTGRES_PORT=$(POSTGRES_PORT) \
+			POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER) \
+			POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
+			DATARESCUE_REVENUE_COLUMN=$${REVENUE_COLUMN:-net_amount} \
+			DBT_SCHEMA=$${DBT_SCHEMA:-analytics} $(DBT) build $(DBT_FLAGS) \
+			--target-path "$$target_path"
 
 dbt-build-healthy: demo-data-reset ## Build and test the healthy amount model.
 	REVENUE_COLUMN=amount DBT_SCHEMA=analytics $(MAKE) dbt-build
@@ -110,19 +143,125 @@ dbt-candidates: demo-drift ## Apply drift and validate both candidates.
 	@$(MAKE) dbt-candidates-current
 
 dbt-docs: postgres-up ## Generate dbt manifest and catalog for the selected mapping.
-	POSTGRES_HOST=$(POSTGRES_HOST) POSTGRES_PORT=$(POSTGRES_PORT) \
-		POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER) \
-		POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
-		DATARESCUE_REVENUE_COLUMN=$${REVENUE_COLUMN:-net_amount} \
-		DBT_SCHEMA=$${DBT_SCHEMA:-analytics} $(DBT) docs generate $(DBT_FLAGS)
+	@set -euo pipefail; \
+		lock_runtime="$$(mktemp -d "$${TMPDIR:-/tmp}/datarescue-dbt-lock.XXXXXX")"; \
+		owner_pid="$$$$"; \
+		lock_pid=""; \
+		docs_target=""; \
+		publish_target=""; \
+		cleanup() { \
+			if [[ -n "$$lock_pid" ]]; then \
+				kill -TERM "$$lock_pid" 2>/dev/null || true; \
+				wait "$$lock_pid" 2>/dev/null || true; \
+			fi; \
+			[[ -z "$$docs_target" ]] || rm -rf -- "$$docs_target"; \
+			[[ -z "$$publish_target" ]] || rm -rf -- "$$publish_target"; \
+			rm -rf -- "$$lock_runtime"; \
+		}; \
+		trap cleanup EXIT INT TERM; \
+		python3 scripts/dbt-artifact-lock.py --lock "$(DBT_ARTIFACT_LOCK)" \
+			--ready "$$lock_runtime/ready" --owner-pid "$$owner_pid" & \
+		lock_pid=$$!; \
+		for _attempt in $$(seq 1 100); do \
+			[[ -f "$$lock_runtime/ready" ]] && break; \
+			if ! kill -0 "$$lock_pid" 2>/dev/null; then \
+				wait "$$lock_pid" 2>/dev/null || true; \
+				lock_pid=""; \
+				echo "Unable to acquire the dbt artifact publication lock." >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.05; \
+		done; \
+		test -f "$$lock_runtime/ready" || { \
+			echo "Timed out acquiring the dbt artifact publication lock." >&2; \
+			exit 1; \
+		}; \
+		docs_target="$$(mktemp -d "$${TMPDIR:-/tmp}/datarescue-dbt-docs.XXXXXX")"; \
+		publish_root="$${DBT_ARTIFACT_OUTPUT_DIR:-$(DBT_PROJECT_DIR)/target}"; \
+		mkdir -p "$$publish_root"; \
+		publish_target="$$(mktemp -d "$$publish_root/.publish-docs.XXXXXX")"; \
+		POSTGRES_HOST=$(POSTGRES_HOST) POSTGRES_PORT=$(POSTGRES_PORT) \
+			POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER) \
+			POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
+			DATARESCUE_REVENUE_COLUMN=$${REVENUE_COLUMN:-net_amount} \
+			DBT_SCHEMA=$${DBT_SCHEMA:-analytics} $(DBT) docs generate $(DBT_FLAGS) \
+			--target-path "$$docs_target"; \
+		test -s "$$docs_target/manifest.json"; \
+		test -s "$$docs_target/catalog.json"; \
+		cp "$$docs_target/manifest.json" "$$publish_target/manifest.json"; \
+		cp "$$docs_target/catalog.json" "$$publish_target/catalog.json"; \
+		mv -f "$$publish_target/manifest.json" "$$publish_root/manifest.json"; \
+		mv -f "$$publish_target/catalog.json" "$$publish_root/catalog.json"
 
 dbt-artifacts-current: ## Build selected net mapping and DataHub dbt artifacts.
-	REVENUE_COLUMN=net_amount DBT_SCHEMA=analytics $(MAKE) dbt-build
-	REVENUE_COLUMN=net_amount DBT_SCHEMA=analytics $(MAKE) dbt-docs
+	@REVENUE_COLUMN=net_amount DBT_SCHEMA=analytics $(MAKE) dbt-artifacts-selected
 
 dbt-artifacts-healthy: demo-data-reset ## Build healthy amount artifacts for initial DataHub ingestion.
-	REVENUE_COLUMN=amount DBT_SCHEMA=analytics $(MAKE) dbt-build
-	REVENUE_COLUMN=amount DBT_SCHEMA=analytics $(MAKE) dbt-docs
+	@REVENUE_COLUMN=amount DBT_SCHEMA=analytics $(MAKE) dbt-artifacts-selected
+
+dbt-artifacts-selected: postgres-up ## Build isolated artifacts and publish one internally consistent set.
+	@set -euo pipefail; \
+		lock_runtime="$$(mktemp -d "$${TMPDIR:-/tmp}/datarescue-dbt-lock.XXXXXX")"; \
+		owner_pid="$$$$"; \
+		lock_pid=""; \
+		build_target=""; \
+		docs_target=""; \
+		publish_target=""; \
+		cleanup() { \
+			if [[ -n "$$lock_pid" ]]; then \
+				kill -TERM "$$lock_pid" 2>/dev/null || true; \
+				wait "$$lock_pid" 2>/dev/null || true; \
+			fi; \
+			[[ -z "$$build_target" ]] || rm -rf -- "$$build_target"; \
+			[[ -z "$$docs_target" ]] || rm -rf -- "$$docs_target"; \
+			[[ -z "$$publish_target" ]] || rm -rf -- "$$publish_target"; \
+			rm -rf -- "$$lock_runtime"; \
+		}; \
+		trap cleanup EXIT INT TERM; \
+		python3 scripts/dbt-artifact-lock.py --lock "$(DBT_ARTIFACT_LOCK)" \
+			--ready "$$lock_runtime/ready" --owner-pid "$$owner_pid" & \
+		lock_pid=$$!; \
+		for _attempt in $$(seq 1 100); do \
+			[[ -f "$$lock_runtime/ready" ]] && break; \
+			if ! kill -0 "$$lock_pid" 2>/dev/null; then \
+				wait "$$lock_pid" 2>/dev/null || true; \
+				lock_pid=""; \
+				echo "Unable to acquire the dbt artifact publication lock." >&2; \
+				exit 1; \
+			fi; \
+			sleep 0.05; \
+		done; \
+		test -f "$$lock_runtime/ready" || { \
+			echo "Timed out acquiring the dbt artifact publication lock." >&2; \
+			exit 1; \
+		}; \
+		build_target="$$(mktemp -d "$${TMPDIR:-/tmp}/datarescue-dbt-artifact-build.XXXXXX")"; \
+		docs_target="$$(mktemp -d "$${TMPDIR:-/tmp}/datarescue-dbt-artifact-docs.XXXXXX")"; \
+		publish_root="$${DBT_ARTIFACT_OUTPUT_DIR:-$(DBT_PROJECT_DIR)/target}"; \
+		mkdir -p "$$publish_root"; \
+		publish_target="$$(mktemp -d "$$publish_root/.publish-artifacts.XXXXXX")"; \
+		POSTGRES_HOST=$(POSTGRES_HOST) POSTGRES_PORT=$(POSTGRES_PORT) \
+			POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER) \
+			POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
+			DATARESCUE_REVENUE_COLUMN=$${REVENUE_COLUMN:-net_amount} \
+			DBT_SCHEMA=$${DBT_SCHEMA:-analytics} $(DBT) build $(DBT_FLAGS) \
+			--target-path "$$build_target"; \
+		POSTGRES_HOST=$(POSTGRES_HOST) POSTGRES_PORT=$(POSTGRES_PORT) \
+			POSTGRES_DB=$(POSTGRES_DB) POSTGRES_USER=$(POSTGRES_USER) \
+			POSTGRES_PASSWORD=$(POSTGRES_PASSWORD) \
+			DATARESCUE_REVENUE_COLUMN=$${REVENUE_COLUMN:-net_amount} \
+			DBT_SCHEMA=$${DBT_SCHEMA:-analytics} $(DBT) docs generate $(DBT_FLAGS) \
+			--target-path "$$docs_target"; \
+		test -s "$$build_target/run_results.json"; \
+		test -s "$$docs_target/manifest.json"; \
+		test -s "$$docs_target/catalog.json"; \
+		python3 -c 'import json, pathlib, sys; data=json.loads(pathlib.Path(sys.argv[1]).read_text()); assert data.get("args", {}).get("which") == "build", "run_results.json is not from dbt build"' "$$build_target/run_results.json"; \
+		cp "$$build_target/run_results.json" "$$publish_target/run_results.json"; \
+		cp "$$docs_target/manifest.json" "$$publish_target/manifest.json"; \
+		cp "$$docs_target/catalog.json" "$$publish_target/catalog.json"; \
+		mv -f "$$publish_target/run_results.json" "$$publish_root/run_results.json"; \
+		mv -f "$$publish_target/manifest.json" "$$publish_root/manifest.json"; \
+		mv -f "$$publish_target/catalog.json" "$$publish_root/catalog.json"
 
 dbt-artifacts: demo-drift ## Generate drifted manifest, run-results and catalog.
 	@$(MAKE) dbt-artifacts-current
@@ -137,21 +276,72 @@ datahub-up: ## Start supported DataHub v1.6 Quickstart (requires Docker Compose 
 		echo "Install/repair Compose, then rerun 'make datahub-up'." >&2; \
 		exit 1; \
 	fi
-	$(DATAHUB_CLI) docker quickstart --version $(DATAHUB_RELEASE) --dump-logs-on-failure
+	DATAHUB_MAPPED_GMS_PORT=$(DATAHUB_MAPPED_GMS_PORT) \
+		$(DATAHUB_CLI) docker quickstart --version $(DATAHUB_RELEASE) --dump-logs-on-failure
 	@$(MAKE) datahub-check
 
 datahub-down: ## Stop the supported DataHub Quickstart stack.
-	$(DATAHUB_CLI) docker quickstart --stop
+	$(DATAHUB_CLI) docker quickstart --version $(DATAHUB_RELEASE) --stop
 
 datahub-ingest-postgres: postgres-up datahub-check ## Ingest PostgreSQL metadata into DataHub.
 	$(DEMO_RUNTIME) datahub-ingest-postgres
 
-datahub-ingest-dbt: dbt-artifacts datahub-check ## Ingest dbt artifacts into DataHub.
-	$(DEMO_RUNTIME) datahub-ingest-dbt
+datahub-ingest-dbt: postgres-up datahub-check ## Build and ingest one immutable dbt artifact snapshot.
+	@set -euo pipefail; \
+		mkdir -p "$(DBT_ARTIFACT_SNAPSHOT_ROOT)"; \
+		snapshot="$$(mktemp -d "$(DBT_ARTIFACT_SNAPSHOT_ROOT)/dbt-ingest.XXXXXX")"; \
+		cleanup() { rm -rf -- "$$snapshot"; }; \
+		trap cleanup EXIT INT TERM; \
+		REVENUE_COLUMN="$${REVENUE_COLUMN:-net_amount}" \
+			DBT_SCHEMA="$${DBT_SCHEMA:-analytics}" \
+			DBT_ARTIFACT_OUTPUT_DIR="$$snapshot" \
+			$(MAKE) dbt-artifacts-selected; \
+		DBT_ARTIFACT_ROOT_HOST="$$snapshot" $(DEMO_RUNTIME) datahub-ingest-dbt
 
-datahub-ingest: dbt-artifacts datahub-check ## Build artifacts, then run both DataHub recipes.
+datahub-ingest: demo-drift datahub-check ## Apply drift, then ingest PostgreSQL and immutable dbt artifacts.
 	$(DEMO_RUNTIME) datahub-ingest-postgres
-	$(DEMO_RUNTIME) datahub-ingest-dbt
+	@REVENUE_COLUMN=net_amount DBT_SCHEMA=analytics $(MAKE) datahub-ingest-dbt
+
+datahub-seed-context: datahub-check ## Idempotently seed glossary, owner, document, and verify dbt lineage.
+	@DATAHUB_GMS_URL="$(DATAHUB_GMS_URL)" $(DATAHUB_CONTEXT) seed
+
+datahub-verify-context: datahub-check ## Fail closed unless exact connected semantic context exists.
+	@DATAHUB_GMS_URL="$(DATAHUB_GMS_URL)" $(DATAHUB_CONTEXT) verify
+
+datahub-mcp-start: datahub-check ## Start the pinned official DataHub MCP HTTP server.
+	@DATAHUB_GMS_URL="$(DATAHUB_GMS_URL)" DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" \
+		DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" bash scripts/datahub-mcp.sh start
+
+datahub-mcp-stop: ## Stop the MCP process owned by the repository launcher.
+	@DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" \
+		bash scripts/datahub-mcp.sh stop
+
+datahub-mcp-verify: datahub-verify-context ## Verify a running official MCP server and live context calls.
+	@DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" \
+		bash scripts/datahub-mcp.sh verify
+
+datahub-mcp-proof: api-install ## Prove official MCP context reads and real DataHub write-back.
+	@$(MAKE) datahub-up
+	@$(MAKE) datahub-seed-healthy
+	@set -euo pipefail; \
+		started_here=false; \
+		if ! DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" \
+			bash scripts/datahub-mcp.sh status >/dev/null 2>&1; then \
+			DATAHUB_GMS_URL="$(DATAHUB_GMS_URL)" DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" \
+				DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" bash scripts/datahub-mcp.sh start; \
+			started_here=true; \
+		fi; \
+		cleanup() { \
+			if [[ "$$started_here" == "true" ]]; then \
+				DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" \
+					bash scripts/datahub-mcp.sh stop >/dev/null 2>&1 || true; \
+			fi; \
+		}; \
+		trap cleanup EXIT INT TERM; \
+		DATAHUB_MCP_HOST="$(DATAHUB_MCP_HOST)" DATAHUB_MCP_PORT="$(DATAHUB_MCP_PORT)" \
+			bash scripts/datahub-mcp.sh verify; \
+		DATARESCUE_DATAHUB_MCP_URL="$(DATAHUB_MCP_URL)" \
+			$(UV_RUN) python scripts/verify-datahub-mcp-proof.py
 
 datahub-validate: dbt-artifacts ## Dry-run both recipes without writing to DataHub.
 	DATAHUB_INGEST_DRY_RUN=1 $(DEMO_RUNTIME) datahub-ingest-postgres
@@ -179,15 +369,18 @@ datahub-actions-run: ## Consume schemaMetadata MCLs; requires a ready DataRescue
 		DATARESCUE_API_URL=$(DATARESCUE_API_URL) \
 		bash scripts/datahub-actions.sh run
 
-datahub-seed-healthy: dbt-artifacts-healthy datahub-check ## Ingest the healthy schema as MCL baseline.
+datahub-seed-healthy: demo-data-reset datahub-check ## Ingest the healthy schema as MCL baseline.
 	$(DEMO_RUNTIME) datahub-ingest-postgres
-	$(DEMO_RUNTIME) datahub-ingest-dbt
+	@REVENUE_COLUMN=amount DBT_SCHEMA=analytics $(MAKE) datahub-ingest-dbt
+	@$(MAKE) datahub-seed-context
 
 datahub-apply-drift: demo-drift datahub-check ## Emit real drift MCL, validate candidates and ingest selected dbt state.
 	$(DEMO_RUNTIME) datahub-ingest-postgres
 	@$(MAKE) dbt-candidates-current
-	@$(MAKE) dbt-artifacts-current
-	$(DEMO_RUNTIME) datahub-ingest-dbt
+	@REVENUE_COLUMN=net_amount DBT_SCHEMA=analytics $(MAKE) datahub-ingest-dbt
+
+datahub-mcl-proof: api-install ## Prove automatic MCL intake and live GraphQL incident creation without cloud credentials.
+	@bash scripts/datahub-mcl-proof.sh
 
 demo-ready: dbt-candidates ## Prepare deterministic replay data and both validation results.
 	@echo "Demo data is ready: gross rejected (+3.40%), net selected (0.00%)."

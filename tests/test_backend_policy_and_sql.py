@@ -123,6 +123,13 @@ def test_dbt_patch_is_idempotent_for_the_validated_mapping() -> None:
 def test_model_evidence_references_must_exist_in_context() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/responses"
+        payload = json.loads(request.content)
+        assert payload["model"] == "gpt-5.6-terra"
+        assert payload["reasoning"] == {"effort": "medium"}
+        output_format = payload["text"]["format"]
+        assert output_format["type"] == "json_schema"
+        assert output_format["strict"] is True
+        assert output_format["schema"]["additionalProperties"] is False
         return httpx.Response(
             200,
             json={

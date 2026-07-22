@@ -6,11 +6,9 @@ source:
     username: "${POSTGRES_USER}"
     password: "${POSTGRES_PASSWORD}"
     env: PROD
-    platform_instance: datarescue-demo
     convert_urns_to_lowercase: true
     include_tables: true
     include_views: true
-    include_table_lineage: true
     include_view_lineage: true
     schema_pattern:
       allow:

@@ -44,8 +44,25 @@ def test_graphql_http_200_with_errors_is_a_failed_operation() -> None:
 
 def test_graphql_incident_lifecycle_uses_datahub_1_6_inputs() -> None:
     requests: list[dict[str, object]] = []
+    remote_state = "ACTIVE"
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal remote_state
+        if request.method == "GET":
+            assert request.url.raw_path.endswith(
+                b"/openapi/v3/entity/incident/"
+                b"urn%3Ali%3Aincident%3Adr-test/incidentInfo"
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "value": {
+                        "entities": ["urn:li:dataset:test"],
+                        "title": "DataRescue schema drift DR-TEST",
+                        "status": {"state": remote_state},
+                    }
+                },
+            )
         body = json.loads(request.content)
         requests.append(body)
         if "raiseIncident" in body["query"]:
@@ -60,6 +77,7 @@ def test_graphql_incident_lifecycle_uses_datahub_1_6_inputs() -> None:
                 "message": "DataRescue post-deploy evidence gates passed.",
             },
         }
+        remote_state = "RESOLVED"
         return httpx.Response(200, json={"data": {"updateIncidentStatus": True}})
 
     adapter = DataHubGraphQLAdapter(
@@ -73,4 +91,6 @@ def test_graphql_incident_lifecycle_uses_datahub_1_6_inputs() -> None:
 
     assert raised.status is IntegrationStatus.SUCCEEDED
     assert resolved.status is IntegrationStatus.SUCCEEDED
+    assert raised.details == {"readback_verified": True, "remote_state": "ACTIVE"}
+    assert resolved.details == {"readback_verified": True, "remote_state": "RESOLVED"}
     assert len(requests) == 2

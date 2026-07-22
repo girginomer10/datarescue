@@ -50,6 +50,8 @@ credentials, and labels every external operation that was not run. Use
 make demo-drift       # apply amount → gross_amount + net_amount
 make demo-data-reset  # restore the healthy amount fixture
 make test-demo        # run both candidates against PostgreSQL/dbt
+make datahub-mcl-proof # real Kafka MCL → live incident → restart-safe dedup
+make datahub-mcp-proof # official MCP reads + real DataHub document write-back
 make test             # backend, frontend, and dbt integration suites
 make lint             # Python checks and frontend type/build checks
 make check            # lint, tests, integrations, and production build
@@ -120,16 +122,27 @@ make demo-connected
 ```
 
 It starts the pinned DataHub v1.6 Quickstart, ingests the healthy baseline,
-checks live MCP context, starts the API in `replay=false` / `postgres` mode,
-waits for the pinned DataHub Actions consumer to subscribe, and only then
-ingests the drift. It refuses to start without all of the following:
+seeds and verifies the exact glossary/owner/document/lineage contract, starts
+the official `mcp-server-datahub==0.6.0` on loopback, checks live MCP context,
+starts the API in `replay=false` / `postgres` mode, waits for the pinned DataHub
+Actions consumer to subscribe, and only then ingests the drift. A bounded
+verifier then requires exactly one proof-owned MCL case to reach `PR_OPEN` with
+the DataHub incident still remotely `ACTIVE`; containment, failure, timeout, or
+incomplete evidence makes the command fail. The launcher does not merge the
+draft PR, deploy it, or claim incident resolution. Set
+`DATARESCUE_DATAHUB_MCP_URL` only to use an externally managed HTTPS MCP
+server, with a separate `DATARESCUE_DATAHUB_MCP_TOKEN` when needed. DataHub GMS
+credentials are never sent to that server. Otherwise the launcher owns
+`http://127.0.0.1:8001/mcp` for the run. It refuses to start without all of the
+following:
 
-- `DATARESCUE_DATAHUB_MCP_URL` for live schema, lineage, glossary, ownership, and document context.
 - `DATARESCUE_OPENAI_API_KEY` (or `OPENAI_API_KEY`) for structured candidate proposals.
 - An authenticated `gh` CLI (optionally `GH_TOKEN` / `GITHUB_TOKEN`) and
   `DATARESCUE_GITHUB_REPOSITORY` for a real draft PR.
-- Reachable Kafka and Schema Registry endpoints. The official pinned Quickstart
-  defaults are `127.0.0.1:9092` and `http://127.0.0.1:8081`; override
+- Reachable Kafka and Schema Registry endpoints. DataRescue maps the pinned
+  Quickstart GMS to `127.0.0.1:18080`; Kafka is `127.0.0.1:9092` and the
+  v1.6 internal Schema Registry is proxied at
+  `http://127.0.0.1:18080/schema-registry/api/`. Override
   `DATAHUB_KAFKA_BOOTSTRAP` and `DATAHUB_SCHEMA_REGISTRY_URL` explicitly for any
   other deployment.
 
@@ -139,6 +152,25 @@ Actions v1.6.0.15 recipe and custom action import without starting a consumer:
 ```bash
 make datahub-actions-validate
 ```
+
+Two bounded proofs exercise the connected DataHub substrate without OpenAI or
+GitHub credentials:
+
+```bash
+make datahub-mcl-proof
+make datahub-mcp-proof
+```
+
+The first proves automatic Kafka MCL intake, a real incident mutation followed
+by an exact `incidentInfo` read-back of remote `ACTIVE` state, fail-closed
+containment, and durable deduplication after API restart. The second proves
+official MCP `get_entities`, `list_schema_fields`, `get_lineage`, and
+`save_document` calls against the live catalog. Document persistence is checked
+independently through DataHub GMS `documentInfo`, including the exact saved
+title, content, and related asset; the MCP response alone is not accepted as
+proof. These bounded proofs do not claim the OpenAI or draft-PR stages ran.
+Stop the retained infrastructure with `make datahub-down` and
+`make postgres-down` when finished.
 
 Tokens should be least-privilege and scoped to allowlisted assets/repositories. DataHub-provided SQL and other metadata are untrusted and are never executed directly.
 

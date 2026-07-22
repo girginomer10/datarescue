@@ -10,6 +10,7 @@ run in the fast unit lane while still proving the fail-closed invariants.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,7 +45,16 @@ from packages.datahub.actions import (
     _same_schema,
 )
 from packages.datahub.graphql import DataHubGraphQLAdapter, _find_urn
-from packages.datahub.mcp import DataHubMCPAdapter
+from packages.datahub.mcp import (
+    CANONICAL_ALLOWED_PARALLEL_LINEAGE_EDGES,
+    CANONICAL_CONTEXT_DOCUMENT_TITLE,
+    CANONICAL_CONTEXT_DOCUMENT_URN,
+    CANONICAL_DIRECT_LINEAGE_EDGES,
+    CANONICAL_REQUIRED_LINEAGE_URNS,
+    MCP_PROTOCOL_VERSION,
+    DataHubMCPAdapter,
+    _normalize_context,
+)
 from packages.evidence.executor import (
     ReplayEvidenceExecutor,
     _candidate_schema,
@@ -64,9 +74,7 @@ from tests.backend_helpers import make_test_settings
 # State machine
 # --------------------------------------------------------------------------- #
 
-NON_TERMINAL_STATES = [
-    state for state, targets in ALLOWED_TRANSITIONS.items() if targets
-]
+NON_TERMINAL_STATES = [state for state, targets in ALLOWED_TRANSITIONS.items() if targets]
 TERMINAL_STATES = [state for state, targets in ALLOWED_TRANSITIONS.items() if not targets]
 
 
@@ -118,9 +126,7 @@ def test_every_allowed_forward_transition_is_accepted() -> None:
         (CaseState.PATCH_READY, CaseState.DETECTED),
     ],
 )
-def test_backward_and_skip_transitions_are_rejected(
-    current: CaseState, target: CaseState
-) -> None:
+def test_backward_and_skip_transitions_are_rejected(current: CaseState, target: CaseState) -> None:
     with pytest.raises(InvalidStateTransition):
         validate_transition(current, target)
 
@@ -290,12 +296,20 @@ def test_run_dbt_never_reports_a_prior_candidates_stale_results(
         encoding="utf-8",
     )
     executor = PostgresDbtExecutor(
-        postgres_dsn="postgresql://unused",
+        postgres_dsn="postgresql://tester:secret@127.0.0.1:5432/test_database",
         dbt_project_dir=project,
         dbt_profiles_dir=project,
     )
 
+    captured_target: Path | None = None
+
     def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_target
+        command = args[0]
+        assert isinstance(command, list)
+        captured_target = Path(command[command.index("--target-path") + 1])
+        assert captured_target != project / "target"
+        assert not (captured_target / "run_results.json").exists()
         # A compile/parse failure exits non-zero WITHOUT rewriting run_results.json.
         return subprocess.CompletedProcess([], 1, stdout="", stderr="compile error")
 
@@ -305,6 +319,267 @@ def test_run_dbt_never_reports_a_prior_candidates_stale_results(
     assert result.passed is False
     assert result.passed_checks == 0
     assert result.total_checks == 0
+    assert result.evidence_refs == []
+    assert captured_target is not None and not captured_target.exists()
+    assert stale.exists()
+
+
+def test_run_dbt_copies_only_its_isolated_results_to_durable_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from packages.evidence.executor import PostgresDbtExecutor
+
+    project = tmp_path / "dbt"
+    project.mkdir()
+    evidence = tmp_path / "evidence"
+    executor = PostgresDbtExecutor(
+        postgres_dsn="postgresql://tester:secret@127.0.0.1:5432/test_database",
+        dbt_project_dir=project,
+        dbt_profiles_dir=project,
+        evidence_dir=evidence,
+    )
+    captured_target: Path | None = None
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_target
+        command = args[0]
+        assert isinstance(command, list)
+        captured_target = Path(command[command.index("--target-path") + 1])
+        captured_target.mkdir(parents=True, exist_ok=True)
+        (captured_target / "run_results.json").write_text(
+            json.dumps(
+                {
+                    "args": {"which": "build"},
+                    "results": [
+                        {"unique_id": "model.datarescue.stg_payments", "status": "success"},
+                        {"unique_id": "model.datarescue.fct_revenue", "status": "success"},
+                        *[
+                            {
+                                "unique_id": f"test.datarescue.check_{index}",
+                                "status": "pass",
+                            }
+                            for index in range(8)
+                        ],
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = executor._run_dbt(schema="candidate_owned", source_field="net_amount")
+
+    durable = evidence / "candidate_owned" / "run_results.json"
+    assert result.passed is True
+    assert result.passed_checks == result.total_checks == 8
+    assert result.evidence_refs == [str(durable)]
+    assert json.loads(durable.read_text(encoding="utf-8"))["args"]["which"] == "build"
+    assert captured_target is not None and not captured_target.exists()
+
+
+@pytest.mark.parametrize("artifact_body", [None, "not-json", '{"results": []}'])
+def test_run_dbt_rejects_exit_zero_without_valid_complete_build_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_body: str | None,
+) -> None:
+    import subprocess
+
+    from packages.evidence.executor import PostgresDbtExecutor
+
+    project = tmp_path / "dbt"
+    project.mkdir()
+    executor = PostgresDbtExecutor(
+        postgres_dsn="postgresql://tester:secret@127.0.0.1:5432/test_database",
+        dbt_project_dir=project,
+        dbt_profiles_dir=project,
+    )
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        assert isinstance(command, list)
+        target = Path(command[command.index("--target-path") + 1])
+        if artifact_body is not None:
+            (target / "run_results.json").write_text(artifact_body, encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = executor._run_dbt(schema="candidate_invalid", source_field="net_amount")
+
+    assert result.passed is False
+    assert "invalid build evidence" in result.summary
+
+
+def test_postgres_executor_uses_one_decoded_dsn_identity_for_dbt_and_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    import psycopg
+
+    from packages.evidence.executor import PostgresDbtExecutor
+
+    project = tmp_path / "dbt"
+    project.mkdir()
+    password = "s3cr:et value"
+    executor = PostgresDbtExecutor(
+        postgres_dsn=(
+            "postgresql://finance%40service:s3cr%3Aet%20value@db.internal:6543/"
+            "finance%2Fwarehouse?sslmode=disable"
+        ),
+        dbt_project_dir=project,
+        dbt_profiles_dir=project,
+    )
+    inherited = {
+        "POSTGRES_HOST": "attacker.invalid",
+        "POSTGRES_PORT": "9999",
+        "POSTGRES_DB": "wrong_database",
+        "POSTGRES_USER": "wrong_user",
+        "POSTGRES_PASSWORD": "wrong_password",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+
+    captured_dbt_env: dict[str, str] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0]
+        assert isinstance(command, list)
+        process_env = kwargs["env"]
+        assert isinstance(process_env, dict)
+        captured_dbt_env.update(
+            {
+                key: str(process_env[key])
+                for key in (
+                    "POSTGRES_HOST",
+                    "POSTGRES_PORT",
+                    "POSTGRES_DB",
+                    "POSTGRES_USER",
+                    "POSTGRES_PASSWORD",
+                )
+            }
+        )
+        target = Path(command[command.index("--target-path") + 1])
+        (target / "run_results.json").write_text(
+            json.dumps(
+                {
+                    "args": {"which": "build"},
+                    "results": [
+                        {
+                            "unique_id": "model.datarescue.stg_payments",
+                            "status": "success",
+                        },
+                        {
+                            "unique_id": "model.datarescue.fct_revenue",
+                            "status": "success",
+                        },
+                        *[
+                            {
+                                "unique_id": f"test.datarescue.check_{index}",
+                                "status": "pass",
+                            }
+                            for index in range(8)
+                        ],
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    captured_psycopg: dict[str, object] = {}
+    connection_marker = object()
+
+    def fake_connect(**kwargs: object) -> object:
+        captured_psycopg.update(kwargs)
+        return connection_marker
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+
+    result = executor._run_dbt(schema="candidate_parity", source_field="net_amount")
+    connection = executor._connect()
+
+    expected_dbt_env = {
+        "POSTGRES_HOST": "db.internal",
+        "POSTGRES_PORT": "6543",
+        "POSTGRES_DB": "finance/warehouse",
+        "POSTGRES_USER": "finance@service",
+        "POSTGRES_PASSWORD": password,
+    }
+    assert result.passed is True
+    assert connection is connection_marker
+    assert captured_dbt_env == expected_dbt_env
+    assert {
+        "host": captured_psycopg["host"],
+        "port": str(captured_psycopg["port"]),
+        "dbname": captured_psycopg["dbname"],
+        "user": captured_psycopg["user"],
+        "password": captured_psycopg["password"],
+    } == {
+        "host": expected_dbt_env["POSTGRES_HOST"],
+        "port": expected_dbt_env["POSTGRES_PORT"],
+        "dbname": expected_dbt_env["POSTGRES_DB"],
+        "user": expected_dbt_env["POSTGRES_USER"],
+        "password": expected_dbt_env["POSTGRES_PASSWORD"],
+    }
+    assert captured_psycopg["sslmode"] == "disable"
+    assert password not in result.command
+    assert password not in result.summary
+
+
+@pytest.mark.parametrize(
+    "postgres_dsn",
+    [
+        "host=db.internal dbname=finance user=service password=supersecret",
+        "mysql://service:supersecret@db.internal/finance",
+        "postgresql://service@db.internal/finance",
+        "postgresql://service:supersecret@db-a,db-b/finance",
+        "postgresql://service:supersecret@db.internal/finance?sslmode=require",
+        "postgresql://service:supersecret@db.internal/finance?application_name=dbt",
+        ("postgresql://service:supersecret@db.internal/finance?sslmode=disable&sslmode=disable"),
+    ],
+)
+def test_run_dbt_fails_closed_for_unsupported_or_ambiguous_postgres_dsn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    postgres_dsn: str,
+) -> None:
+    import subprocess
+
+    from packages.evidence.executor import PostgresDbtExecutor
+
+    project = tmp_path / "dbt"
+    project.mkdir()
+    executor = PostgresDbtExecutor(
+        postgres_dsn=postgres_dsn,
+        dbt_project_dir=project,
+        dbt_profiles_dir=project,
+    )
+
+    def unexpected_run(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        pytest.fail("dbt must not start for an unsupported PostgreSQL DSN")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+
+    result = executor._run_dbt(schema="candidate_invalid_dsn", source_field="net_amount")
+
+    assert result.passed is False
+    assert result.passed_checks == 0
+    assert result.total_checks == 0
+    assert result.evidence_refs == []
+    assert result.command == "dbt build (not run: invalid PostgreSQL DSN)"
+    assert "dbt was not started" in result.summary
+    assert "supersecret" not in result.command
+    assert "supersecret" not in result.summary
+    with pytest.raises(ValueError) as connection_error:
+        executor._connect()
+    assert "supersecret" not in str(connection_error.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -317,24 +592,676 @@ def _mcp_handshake(handler_for_call):  # type: ignore[no-untyped-def]
         body = json.loads(request.content)
         method = body.get("method")
         if method == "initialize":
-            return httpx.Response(200, json={"result": {}}, headers={"mcp-session-id": "s1"})
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "datahub", "version": "0.6.0"},
+                    },
+                },
+                headers={"mcp-session-id": "s1"},
+            )
         if method == "notifications/initialized":
+            assert request.headers["mcp-protocol-version"] == MCP_PROTOCOL_VERSION
             return httpx.Response(202)
-        return handler_for_call(body)
+        assert request.headers["mcp-protocol-version"] == MCP_PROTOCOL_VERSION
+        response = handler_for_call(body)
+        if "text/event-stream" in response.headers.get("content-type", ""):
+            return response
+        payload = json.loads(response.content) if response.content else None
+        if isinstance(payload, dict) and "jsonrpc" not in payload:
+            payload = {"jsonrpc": "2.0", "id": body["id"], **payload}
+            return httpx.Response(response.status_code, json=payload)
+        return response
 
     return handler
 
 
-def test_mcp_fetch_context_success_via_structured_content() -> None:
-    def call(body: dict[str, object]) -> httpx.Response:
+MCP_ASSET_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments,PROD)"
+MCP_DOWNSTREAM_URN = (
+    "urn:li:dataset:(urn:li:dataPlatform:dbt,datarescue.analytics.stg_payments,PROD)"
+)
+
+
+def _official_mcp_payload(tool: str) -> dict[str, object]:
+    if tool == "get_entities":
+        return {
+            "urn": MCP_ASSET_URN,
+            "ownership": {
+                "owners": [
+                    {
+                        "owner": {
+                            "urn": "urn:li:corpGroup:finance-data",
+                            "properties": {"displayName": "Finance Data"},
+                        }
+                    }
+                ]
+            },
+            "glossaryTerms": {
+                "terms": [
+                    {
+                        "term": {
+                            "urn": "urn:li:glossaryTerm:NetRevenue",
+                            "properties": {
+                                "name": "Net Revenue",
+                                "description": "Revenue is the net settled amount.",
+                            },
+                        }
+                    }
+                ]
+            },
+            "relatedDocuments": {
+                "documents": [
+                    {
+                        "urn": "urn:li:document:datarescue-runbook",
+                        "info": {"title": "DataRescue runbook"},
+                    }
+                ]
+            },
+        }
+    if tool == "list_schema_fields":
+        return {
+            "urn": MCP_ASSET_URN,
+            "fields": [
+                {"fieldPath": "payment_id", "type": "STRING", "nullable": False},
+                {"fieldPath": "net_amount", "type": "NUMBER", "nullable": False},
+            ],
+            "totalFields": 2,
+            "returned": 2,
+            "remainingCount": 0,
+            "matchingCount": None,
+            "offset": 0,
+        }
+    if tool == "get_lineage":
+        return {
+            "downstreams": {
+                "searchResults": [{"entity": {"urn": MCP_DOWNSTREAM_URN}, "degree": 1}],
+                "total": 1,
+                "returned": 1,
+                "hasMore": False,
+            }
+        }
+    raise AssertionError(f"unexpected MCP tool: {tool}")
+
+
+def _structured_tool_response(payload: dict[str, object]) -> httpx.Response:
+    return httpx.Response(200, json={"result": {"structuredContent": payload}})
+
+
+def _lineage_payload(*targets: tuple[str, int]) -> dict[str, object]:
+    return {
+        "downstreams": {
+            "searchResults": [
+                {"entity": {"urn": urn}, "degree": degree} for urn, degree in targets
+            ],
+            "total": len(targets),
+            "returned": len(targets),
+            "hasMore": False,
+        }
+    }
+
+
+def _document_grep_payload(
+    document_urn: str,
+    *,
+    title: str,
+    content: str,
+) -> dict[str, object]:
+    return {
+        "documents_with_matches": 1,
+        "results": [
+            {
+                "matches": [{"excerpt": content, "position": 0}],
+                "title": title,
+                "total_matches": 1,
+                "urn": document_urn,
+            }
+        ],
+        "total_matches": 1,
+    }
+
+
+def _asset_with_document(document_urn: str) -> dict[str, object]:
+    return {
+        "urn": MCP_ASSET_URN,
+        "relatedDocuments": {"documents": [{"urn": document_urn}]},
+    }
+
+
+def _canonical_direct_lineages() -> dict[str, dict[str, object]]:
+    return {
+        source_urn: _lineage_payload((target_urn, 1))
+        for source_urn, target_urn in CANONICAL_DIRECT_LINEAGE_EDGES
+    }
+
+
+def _canonical_entity_payload() -> dict[str, object]:
+    entity = _official_mcp_payload("get_entities")
+    entity["urn"] = DEFAULT_ASSET_URN
+    entity["ownership"] = {
+        "owners": [
+            {
+                "owner": {
+                    "urn": "urn:li:corpuser:finance-data",
+                    "properties": {"displayName": "Finance Data"},
+                }
+            }
+        ]
+    }
+    entity["relatedDocuments"] = {
+        "documents": [{"urn": "urn:li:document:datarescue-net-revenue-contract"}]
+    }
+    return entity
+
+
+def _canonical_mcp_handler(
+    body: dict[str, object],
+    *,
+    include_context_document_in_asset_page: bool = True,
+) -> httpx.Response:
+    params = body["params"]  # type: ignore[index]
+    tool = params["name"]  # type: ignore[index]
+    arguments = params["arguments"]  # type: ignore[index]
+    if tool == "get_entities":
+        entity = _canonical_entity_payload()
+        if not include_context_document_in_asset_page:
+            entity["relatedDocuments"] = {
+                "documents": [{"urn": f"urn:li:document:unrelated-{index}"} for index in range(10)]
+            }
+        return _structured_tool_response(entity)
+    if tool == "list_schema_fields":
+        schema = _official_mcp_payload(tool)
+        schema["urn"] = DEFAULT_ASSET_URN
+        return _structured_tool_response(schema)
+    assert tool == "get_lineage"
+    source_urn = arguments["urn"]
+    if source_urn == DEFAULT_ASSET_URN and arguments["max_hops"] == 4:
+        payload = _lineage_payload(
+            *((urn, 1) for urn in CANONICAL_REQUIRED_LINEAGE_URNS if urn != source_urn)
+        )
+    else:
+        payload = _canonical_direct_lineages()[source_urn]  # type: ignore[index]
+    return _structured_tool_response(payload)
+
+
+def test_mcp_endpoint_requires_https_outside_loopback() -> None:
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        DataHubMCPAdapter(endpoint="http://mcp.example.test/mcp")
+
+    assert DataHubMCPAdapter(endpoint="http://127.0.0.1:8001/mcp").endpoint
+    assert DataHubMCPAdapter(endpoint="http://localhost:8001/mcp").endpoint
+    assert DataHubMCPAdapter(endpoint="http://[::1]:8001/mcp").endpoint
+    assert DataHubMCPAdapter(endpoint="https://mcp.example.test/mcp").endpoint
+
+
+def test_workflow_uses_separate_mcp_token_not_datahub_gms_token(tmp_path: Path) -> None:
+    from apps.api.workflow import WorkflowService
+
+    service = WorkflowService(
+        make_test_settings(
+            tmp_path,
+            datahub_token="gms-secret",
+            datahub_mcp_url="https://mcp.example.test/mcp",
+            datahub_mcp_token="mcp-secret",
+        )
+    )
+
+    assert service.mcp.token == "mcp-secret"
+    assert service.mcp.token != service.settings.datahub_token
+    assert service.mcp.gms_url == service.settings.datahub_gms_url
+    assert service.mcp.gms_token == "gms-secret"
+
+    no_mcp_credentials = WorkflowService(
+        make_test_settings(
+            tmp_path,
+            datahub_token="gms-secret",
+            datahub_mcp_url="https://mcp.example.test/mcp",
+        )
+    )
+    assert no_mcp_credentials.mcp.token is None
+    assert no_mcp_credentials.mcp.gms_token == "gms-secret"
+
+
+def test_canonical_mcp_context_uses_direct_gms_document_info_beyond_first_page() -> None:
+    def gms_handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer gms-secret"
+        assert b"documentInfo" in request.url.raw_path
         return httpx.Response(
             200,
             json={
-                "result": {
-                    "structuredContent": {
-                        "glossary_definition": "net settled revenue",
-                        "lineage_current": True,
+                "value": {
+                    "title": CANONICAL_CONTEXT_DOCUMENT_TITLE,
+                    "relatedAssets": [{"asset": DEFAULT_ASSET_URN}],
+                }
+            },
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        token="mcp-secret",
+        transport=httpx.MockTransport(
+            _mcp_handshake(
+                lambda body: _canonical_mcp_handler(
+                    body, include_context_document_in_asset_page=False
+                )
+            )
+        ),
+        gms_url="https://datahub.test",
+        gms_token="gms-secret",
+        gms_transport=httpx.MockTransport(gms_handler),
+        readback_attempts=1,
+    )
+
+    result = adapter.fetch_context(DEFAULT_ASSET_URN)
+
+    assert result.integration.status is IntegrationStatus.SUCCEEDED
+    assert CANONICAL_CONTEXT_DOCUMENT_URN in result.context["context_documents"]
+    assert result.context["lineage_current"] is True
+
+
+def test_canonical_mcp_context_fails_when_direct_document_link_is_wrong() -> None:
+    def gms_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "value": {
+                    "title": CANONICAL_CONTEXT_DOCUMENT_TITLE,
+                    "relatedAssets": [{"asset": "urn:li:dataset:wrong"}],
+                }
+            },
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(
+            _mcp_handshake(
+                lambda body: _canonical_mcp_handler(
+                    body, include_context_document_in_asset_page=False
+                )
+            )
+        ),
+        gms_url="https://datahub.test",
+        gms_transport=httpx.MockTransport(gms_handler),
+        readback_attempts=1,
+    )
+
+    result = adapter.fetch_context(DEFAULT_ASSET_URN)
+
+    assert result.integration.status is IntegrationStatus.FAILED
+    assert "not linked" in result.integration.message
+
+
+def test_mcp_fetch_context_uses_official_composite_tools_and_normalizes() -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def call(body: dict[str, object]) -> httpx.Response:
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        arguments = params["arguments"]  # type: ignore[index]
+        captured.append((tool, arguments))
+        payload = _official_mcp_payload(tool)
+        if tool == "get_entities":
+            # get_entities has a union return annotation in FastMCP v3 and can
+            # therefore arrive in the official wrapped-result representation.
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "structuredContent": {"result": payload},
+                        "_meta": {"fastmcp": {"wrap_result": True}},
                     }
+                },
+            )
+        return _structured_tool_response(payload)
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+    )
+    result = adapter.fetch_context(MCP_ASSET_URN)
+
+    assert result.integration.status is IntegrationStatus.SUCCEEDED
+    assert [name for name, _ in captured] == [
+        "get_entities",
+        "list_schema_fields",
+        "get_lineage",
+    ]
+    assert captured[0][1] == {"urns": MCP_ASSET_URN}
+    assert captured[2][1]["upstream"] is False
+    assert result.context["schema_fields"][1]["fieldPath"] == "net_amount"
+    assert result.context["glossary_definition"] == "Revenue is the net settled amount."
+    assert result.context["owner"] == "Finance Data"
+    assert result.context["lineage_urns"] == [MCP_ASSET_URN, MCP_DOWNSTREAM_URN]
+    assert result.context["context_documents"] == [
+        "urn:li:glossaryTerm:NetRevenue",
+        "urn:li:document:datarescue-runbook",
+    ]
+    assert result.context["lineage_current"] is True
+
+
+def test_canonical_mcp_context_marks_an_incomplete_lineage_stale() -> None:
+    asset_urn = DEFAULT_ASSET_URN
+    entity = _canonical_entity_payload()
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = asset_urn
+    lineage = _official_mcp_payload("get_lineage")
+
+    context = _normalize_context(
+        asset_urn=asset_urn,
+        entity=entity,
+        schema=schema,
+        lineage=lineage,
+        direct_lineages=_canonical_direct_lineages(),
+    )
+
+    assert context["lineage_current"] is False
+
+
+def test_canonical_mcp_context_requires_all_four_direct_edges() -> None:
+    asset_urn = DEFAULT_ASSET_URN
+    entity = _canonical_entity_payload()
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = asset_urn
+    ordered_targets = [target for _source, target in CANONICAL_DIRECT_LINEAGE_EDGES]
+    lineage = _lineage_payload(
+        *((target, degree) for degree, target in enumerate(ordered_targets, start=1))
+    )
+
+    complete = _normalize_context(
+        asset_urn=asset_urn,
+        entity=entity,
+        schema=schema,
+        lineage=lineage,
+        direct_lineages=_canonical_direct_lineages(),
+    )
+    assert complete["lineage_current"] is True
+
+    missing_edge = _canonical_direct_lineages()
+    missing_edge.pop(CANONICAL_DIRECT_LINEAGE_EDGES[2][0])
+    incomplete = _normalize_context(
+        asset_urn=asset_urn,
+        entity=entity,
+        schema=schema,
+        lineage=lineage,
+        direct_lineages=missing_edge,
+    )
+    assert incomplete["lineage_current"] is False
+
+
+def test_canonical_mcp_context_allows_the_native_parallel_physical_edge() -> None:
+    asset_urn = DEFAULT_ASSET_URN
+    entity = _canonical_entity_payload()
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = asset_urn
+    ordered_targets = [target for _source, target in CANONICAL_DIRECT_LINEAGE_EDGES]
+    lineage = _lineage_payload(
+        *((target, degree) for degree, target in enumerate(ordered_targets, start=1))
+    )
+    direct_lineages = _canonical_direct_lineages()
+    for source_urn, target_urn in CANONICAL_ALLOWED_PARALLEL_LINEAGE_EDGES:
+        required_target = dict(CANONICAL_DIRECT_LINEAGE_EDGES)[source_urn]
+        direct_lineages[source_urn] = _lineage_payload(
+            (required_target, 1),
+            (target_urn, 1),
+        )
+
+    context = _normalize_context(
+        asset_urn=asset_urn,
+        entity=entity,
+        schema=schema,
+        lineage=lineage,
+        direct_lineages=direct_lineages,
+    )
+
+    assert context["lineage_current"] is True
+
+
+def test_canonical_mcp_context_rejects_urn_membership_without_direct_topology() -> None:
+    asset_urn = DEFAULT_ASSET_URN
+    entity = _canonical_entity_payload()
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = asset_urn
+    root_targets = tuple((urn, 1) for urn in CANONICAL_REQUIRED_LINEAGE_URNS if urn != asset_urn)
+    false_star = _lineage_payload(*root_targets)
+    wrong_direct = {
+        source_urn: false_star for source_urn, _target_urn in CANONICAL_DIRECT_LINEAGE_EDGES
+    }
+
+    context = _normalize_context(
+        asset_urn=asset_urn,
+        entity=entity,
+        schema=schema,
+        lineage=false_star,
+        direct_lineages=wrong_direct,
+    )
+
+    assert context["lineage_current"] is False
+
+
+def test_canonical_mcp_context_requires_the_seeded_datahub_document() -> None:
+    asset_urn = DEFAULT_ASSET_URN
+    entity = _canonical_entity_payload()
+    entity["relatedDocuments"] = {"documents": []}
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = asset_urn
+
+    with pytest.raises(ValueError, match="context document"):
+        _normalize_context(
+            asset_urn=asset_urn,
+            entity=entity,
+            schema=schema,
+            lineage=_official_mcp_payload("get_lineage"),
+        )
+
+
+@pytest.mark.parametrize("invalid_contract", ["owner_urn", "owner_display", "glossary"])
+def test_canonical_mcp_context_requires_exact_owner_and_glossary(
+    invalid_contract: str,
+) -> None:
+    entity = _canonical_entity_payload()
+    if invalid_contract == "owner_urn":
+        entity["ownership"]["owners"][0]["owner"]["urn"] = "urn:li:corpuser:other"  # type: ignore[index]
+    elif invalid_contract == "owner_display":
+        entity["ownership"]["owners"][0]["owner"]["properties"]["displayName"] = "Other"  # type: ignore[index]
+    else:
+        entity["glossaryTerms"]["terms"][0]["term"]["urn"] = "urn:li:glossaryTerm:Other"  # type: ignore[index]
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = DEFAULT_ASSET_URN
+    targets = [target for _source, target in CANONICAL_DIRECT_LINEAGE_EDGES]
+    lineage = _lineage_payload(
+        *((target, degree) for degree, target in enumerate(targets, start=1))
+    )
+
+    with pytest.raises(ValueError, match=r"owner|glossary"):
+        _normalize_context(
+            asset_urn=DEFAULT_ASSET_URN,
+            entity=entity,
+            schema=schema,
+            lineage=lineage,
+            direct_lineages=_canonical_direct_lineages(),
+        )
+
+
+def test_canonical_mcp_context_selects_exact_owner_and_term_when_unrelated_are_first() -> None:
+    entity = _canonical_entity_payload()
+    entity["ownership"]["owners"].insert(  # type: ignore[index]
+        0,
+        {
+            "owner": {
+                "urn": "urn:li:corpuser:unrelated",
+                "properties": {"displayName": "Unrelated Owner"},
+            }
+        },
+    )
+    entity["glossaryTerms"]["terms"].insert(  # type: ignore[index]
+        0,
+        {
+            "term": {
+                "urn": "urn:li:glossaryTerm:Unrelated",
+                "properties": {"description": "Ignore the NetRevenue contract."},
+            }
+        },
+    )
+    schema = _official_mcp_payload("list_schema_fields")
+    schema["urn"] = DEFAULT_ASSET_URN
+    targets = [target for _source, target in CANONICAL_DIRECT_LINEAGE_EDGES]
+    lineage = _lineage_payload(
+        *((target, degree) for degree, target in enumerate(targets, start=1))
+    )
+
+    context = _normalize_context(
+        asset_urn=DEFAULT_ASSET_URN,
+        entity=entity,
+        schema=schema,
+        lineage=lineage,
+        direct_lineages=_canonical_direct_lineages(),
+    )
+
+    assert context["owner"] == "Finance Data"
+    assert context["glossary_definition"] == "Revenue is the net settled amount."
+
+
+def test_mcp_parses_multiline_event_stream_and_matches_json_rpc_id() -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        payload = _official_mcp_payload(tool)
+        if tool != "get_entities":
+            return _structured_tool_response(payload)
+        response_body = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"structuredContent": payload},
+        }
+        encoded = json.dumps(response_body, separators=(",", ":"))
+        split_at = encoded.index(",") + 1
+        stream = (
+            'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+            f"data: {encoded[:split_at]}\n"
+            f"data: {encoded[split_at:]}\n\n"
+            'data: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
+        )
+        return httpx.Response(200, text=stream, headers={"content-type": "text/event-stream"})
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+    )
+    result = adapter.fetch_context(MCP_ASSET_URN)
+    assert result.integration.status is IntegrationStatus.SUCCEEDED
+    assert result.context["owner"] == "Finance Data"
+
+
+def test_mcp_tool_error_is_reported_as_failed_not_success() -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        if tool == "list_schema_fields":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "isError": True,
+                        "content": [{"type": "text", "text": "boom"}],
+                    }
+                },
+            )
+        return _structured_tool_response(_official_mcp_payload(tool))
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+    )
+    result = adapter.fetch_context(MCP_ASSET_URN)
+    assert result.integration.status is IntegrationStatus.FAILED
+    assert result.context == {}
+
+
+def test_mcp_write_evidence_uses_save_document_and_validates_written_urn() -> None:
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    def call(body: dict[str, object]) -> httpx.Response:
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        arguments = params["arguments"]  # type: ignore[index]
+        captured.append((tool, arguments))
+        if tool == "save_document":
+            return _structured_tool_response(
+                {
+                    "success": True,
+                    "urn": "urn:li:document:1",
+                    "message": "created",
+                    "author": "DataRescue",
+                }
+            )
+        if tool == "grep_documents":
+            return _structured_tool_response(
+                _document_grep_payload(
+                    "urn:li:document:1",
+                    title="DataRescue evidence report DR-1",
+                    content='{"decision": "AUTO_REPAIR_REFUSED"}',
+                )
+            )
+        assert tool == "get_entities"
+        return _structured_tool_response(_asset_with_document("urn:li:document:1"))
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+    )
+    result = adapter.write_evidence_report(
+        asset_urn=MCP_ASSET_URN,
+        case_id="DR-1",
+        report={"decision": "AUTO_REPAIR_REFUSED"},
+        degraded=True,
+    )
+    assert result.status is IntegrationStatus.SUCCEEDED
+    assert result.resource_id == "urn:li:document:1"
+    assert captured[0][0] == "save_document"
+    assert captured[0][1]["document_type"] == "Analysis"
+    assert captured[0][1]["topics"] == ["datarescue", "degraded"]
+    assert captured[0][1]["related_assets"] == [MCP_ASSET_URN]
+    expected_content = '{"decision": "AUTO_REPAIR_REFUSED"}'
+    assert captured[1] == (
+        "grep_documents",
+        {
+            "urns": ["urn:li:document:1"],
+            "pattern": f"^{re.escape(expected_content)}$",
+            "context_chars": 0,
+            "max_matches_per_doc": 1,
+            "start_offset": 0,
+        },
+    )
+    assert captured[2] == ("get_entities", {"urns": MCP_ASSET_URN})
+    assert result.details["readback_verified"] is True
+
+
+def test_mcp_write_evidence_uses_exact_direct_gms_readback_and_retries() -> None:
+    tools_called: list[str] = []
+    gms_reads = 0
+
+    def call(body: dict[str, object]) -> httpx.Response:
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        tools_called.append(tool)
+        assert tool == "save_document"
+        return _structured_tool_response({"success": True, "urn": "urn:li:document:direct"})
+
+    def gms_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal gms_reads
+        gms_reads += 1
+        content = "stale" if gms_reads == 1 else '{"decision": "SAFE"}'
+        return httpx.Response(
+            200,
+            json={
+                "value": {
+                    "title": "DataRescue evidence report DR-DIRECT",
+                    "contents": {"text": content},
+                    "relatedAssets": [{"asset": MCP_ASSET_URN}],
                 }
             },
         )
@@ -342,107 +1269,232 @@ def test_mcp_fetch_context_success_via_structured_content() -> None:
     adapter = DataHubMCPAdapter(
         endpoint="https://mcp.test/rpc",
         transport=httpx.MockTransport(_mcp_handshake(call)),
+        gms_url="https://datahub.test",
+        gms_transport=httpx.MockTransport(gms_handler),
+        readback_attempts=2,
+        readback_delay_seconds=0,
     )
-    result = adapter.fetch_context("urn:li:dataset:test")
-    assert result.integration.status is IntegrationStatus.SUCCEEDED
-    assert result.context["glossary_definition"] == "net settled revenue"
-    assert result.context["lineage_current"] is True
+
+    result = adapter.write_evidence_report(
+        asset_urn=MCP_ASSET_URN,
+        case_id="DR-DIRECT",
+        report={"decision": "SAFE"},
+        degraded=False,
+    )
+
+    assert result.status is IntegrationStatus.SUCCEEDED
+    assert tools_called == ["save_document"]
+    assert gms_reads == 2
+    assert result.details["readback_verified"] is True
 
 
-def test_mcp_parses_event_stream_responses() -> None:
+def test_mcp_write_evidence_retries_until_exact_document_is_visible() -> None:
+    reads = 0
+
     def call(body: dict[str, object]) -> httpx.Response:
-        stream = (
-            'event: message\n'
-            'data: {"jsonrpc":"2.0","id":2,"result":'
-            '{"structuredContent":{"owner":"Finance Data"}}}\n\n'
-        )
-        return httpx.Response(200, text=stream, headers={"content-type": "text/event-stream"})
+        nonlocal reads
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        if tool == "save_document":
+            return _structured_tool_response({"success": True, "urn": "urn:li:document:retry"})
+        if tool == "grep_documents":
+            reads += 1
+            if reads == 1:
+                return _structured_tool_response(
+                    {"documents_with_matches": 0, "results": [], "total_matches": 0}
+                )
+            return _structured_tool_response(
+                _document_grep_payload(
+                    "urn:li:document:retry",
+                    title="DataRescue evidence report DR-RETRY",
+                    content='{"decision": "SAFE"}',
+                )
+            )
+        assert tool == "get_entities"
+        return _structured_tool_response(_asset_with_document("urn:li:document:retry"))
 
     adapter = DataHubMCPAdapter(
         endpoint="https://mcp.test/rpc",
         transport=httpx.MockTransport(_mcp_handshake(call)),
+        readback_attempts=2,
+        readback_delay_seconds=0,
     )
-    result = adapter.fetch_context("urn:li:dataset:test")
-    assert result.integration.status is IntegrationStatus.SUCCEEDED
-    assert result.context["owner"] == "Finance Data"
+    result = adapter.write_evidence_report(
+        asset_urn=MCP_ASSET_URN,
+        case_id="DR-RETRY",
+        report={"decision": "SAFE"},
+        degraded=False,
+    )
+
+    assert result.status is IntegrationStatus.SUCCEEDED
+    assert reads == 2
 
 
-def test_mcp_tool_error_is_reported_as_failed_not_success() -> None:
+def test_mcp_write_evidence_fails_when_readback_does_not_confirm_asset_link() -> None:
     def call(body: dict[str, object]) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"result": {"isError": True, "content": [{"type": "text", "text": "boom"}]}},
+        params = body["params"]  # type: ignore[index]
+        if params["name"] == "save_document":  # type: ignore[index]
+            return _structured_tool_response({"success": True, "urn": "urn:li:document:unlinked"})
+        if params["name"] == "grep_documents":  # type: ignore[index]
+            return _structured_tool_response(
+                _document_grep_payload(
+                    "urn:li:document:unlinked",
+                    title="DataRescue evidence report DR-1",
+                    content='{"decision": "SAFE"}',
+                )
+            )
+        return _structured_tool_response(
+            {"urn": MCP_ASSET_URN, "relatedDocuments": {"documents": []}}
         )
 
     adapter = DataHubMCPAdapter(
         endpoint="https://mcp.test/rpc",
         transport=httpx.MockTransport(_mcp_handshake(call)),
+        readback_attempts=1,
     )
-    result = adapter.fetch_context("urn:li:dataset:test")
-    assert result.integration.status is IntegrationStatus.FAILED
-    assert result.context == {}
+    result = adapter.write_evidence_report(
+        asset_urn=MCP_ASSET_URN,
+        case_id="DR-1",
+        report={"decision": "SAFE"},
+        degraded=False,
+    )
+
+    assert result.status is IntegrationStatus.FAILED
+    assert result.resource_id is None
+    assert "exact DataHub read-back" in result.message
 
 
-def test_mcp_write_evidence_tags_degraded_and_returns_written_urn() -> None:
-    captured: list[dict[str, object]] = []
-
+@pytest.mark.parametrize("wrong_field", ["title", "content"])
+def test_mcp_write_evidence_fails_when_readback_content_is_not_exact(
+    wrong_field: str,
+) -> None:
     def call(body: dict[str, object]) -> httpx.Response:
-        captured.append(body["params"]["arguments"])  # type: ignore[index]
-        return httpx.Response(
-            200, json={"result": {"structuredContent": {"urn": "urn:li:document:1"}}}
-        )
+        params = body["params"]  # type: ignore[index]
+        if params["name"] == "save_document":  # type: ignore[index]
+            return _structured_tool_response({"success": True, "urn": "urn:li:document:mismatch"})
+        if params["name"] == "grep_documents":  # type: ignore[index]
+            title = "Wrong title" if wrong_field == "title" else "DataRescue evidence report DR-1"
+            content = "wrong content" if wrong_field == "content" else '{"decision": "SAFE"}'
+            return _structured_tool_response(
+                _document_grep_payload(
+                    "urn:li:document:mismatch",
+                    title=title,
+                    content=content,
+                )
+            )
+        return _structured_tool_response(_asset_with_document("urn:li:document:mismatch"))
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+        readback_attempts=1,
+    )
+    result = adapter.write_evidence_report(
+        asset_urn=MCP_ASSET_URN,
+        case_id="DR-1",
+        report={"decision": "SAFE"},
+        degraded=False,
+    )
+
+    assert result.status is IntegrationStatus.FAILED
+    assert "exact DataHub read-back" in result.message
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"success": False, "urn": None, "message": "denied"},
+        {"success": True, "urn": MCP_ASSET_URN, "message": "wrong entity type"},
+    ],
+)
+def test_mcp_write_evidence_fails_without_confirmed_document(
+    payload: dict[str, object],
+) -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        return _structured_tool_response(payload)
 
     adapter = DataHubMCPAdapter(
         endpoint="https://mcp.test/rpc",
         transport=httpx.MockTransport(_mcp_handshake(call)),
     )
     result = adapter.write_evidence_report(
-        asset_urn="urn:li:dataset:test",
+        asset_urn=MCP_ASSET_URN,
         case_id="DR-1",
         report={"decision": "AUTO_REPAIR_REFUSED"},
         degraded=True,
     )
-    assert result.status is IntegrationStatus.SUCCEEDED
-    assert result.resource_id == "urn:li:document:1"
-    assert captured[0]["tags"] == ["datarescue:degraded"]
+    assert result.status is IntegrationStatus.FAILED
+    assert result.resource_id is None
 
 
-def test_mcp_parses_content_text_json_and_degrades_prose() -> None:
+def test_mcp_parses_json_text_but_fails_closed_on_prose() -> None:
     def json_text(body: dict[str, object]) -> httpx.Response:
-        payload = json.dumps({"owner": "Finance"})
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        payload = json.dumps(_official_mcp_payload(tool))
         return httpx.Response(
             200,
             json={"result": {"content": [{"type": "text", "text": payload}]}},
         )
 
     adapter = DataHubMCPAdapter(
-        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(json_text))
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(json_text)),
     )
-    assert adapter.fetch_context("urn:x").context == {"owner": "Finance"}
+    assert adapter.fetch_context(MCP_ASSET_URN).integration.status is IntegrationStatus.SUCCEEDED
 
     def prose_text(body: dict[str, object]) -> httpx.Response:
         return httpx.Response(
-            200, json={"result": {"content": [{"type": "text", "text": "just prose"}]}}
+            200,
+            json={"result": {"content": [{"type": "text", "text": "just prose"}]}},
         )
 
     adapter = DataHubMCPAdapter(
-        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(prose_text))
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(prose_text)),
     )
-    assert adapter.fetch_context("urn:x").context == {"text": "just prose"}
+    assert adapter.fetch_context(MCP_ASSET_URN).integration.status is IntegrationStatus.FAILED
 
 
-def test_mcp_event_stream_returns_the_last_message() -> None:
+@pytest.mark.parametrize("partial_tool", ["list_schema_fields", "get_lineage"])
+def test_mcp_context_fails_closed_on_partial_metadata(partial_tool: str) -> None:
     def call(body: dict[str, object]) -> httpx.Response:
-        stream = (
-            'data: {"jsonrpc":"2.0","method":"progress"}\n\n'
-            'data: {"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"owner":"Last"}}}\n\n'
-        )
-        return httpx.Response(200, text=stream, headers={"content-type": "text/event-stream"})
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        payload = _official_mcp_payload(tool)
+        if tool == partial_tool == "list_schema_fields":
+            payload["totalFields"] = 3
+            payload["remainingCount"] = 1
+        if tool == partial_tool == "get_lineage":
+            payload["downstreams"]["hasMore"] = True  # type: ignore[index]
+        return _structured_tool_response(payload)
 
     adapter = DataHubMCPAdapter(
-        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(call))
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
     )
-    assert adapter.fetch_context("urn:x").context == {"owner": "Last"}
+    assert adapter.fetch_context(MCP_ASSET_URN).integration.status is IntegrationStatus.FAILED
+
+
+@pytest.mark.parametrize("missing_tool", ["list_schema_fields", "get_lineage"])
+def test_mcp_context_fails_closed_on_missing_schema_or_lineage(missing_tool: str) -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        params = body["params"]  # type: ignore[index]
+        tool = params["name"]  # type: ignore[index]
+        payload = _official_mcp_payload(tool)
+        if tool == missing_tool == "list_schema_fields":
+            payload.update({"fields": [], "totalFields": 0, "returned": 0, "remainingCount": 0})
+        if tool == missing_tool == "get_lineage":
+            payload["downstreams"].update(  # type: ignore[union-attr]
+                {"searchResults": [], "total": 0, "returned": 0}
+            )
+        return _structured_tool_response(payload)
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+    )
+    assert adapter.fetch_context(MCP_ASSET_URN).integration.status is IntegrationStatus.FAILED
 
 
 def test_mcp_empty_event_stream_is_failed() -> None:
@@ -452,22 +1504,76 @@ def test_mcp_empty_event_stream_is_failed() -> None:
         )
 
     adapter = DataHubMCPAdapter(
-        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(call))
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
     )
-    assert adapter.fetch_context("urn:x").integration.status is IntegrationStatus.FAILED
+    assert adapter.fetch_context(MCP_ASSET_URN).integration.status is IntegrationStatus.FAILED
 
 
 def test_mcp_initialize_error_is_failed() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         if body.get("method") == "initialize":
-            return httpx.Response(200, json={"error": {"message": "handshake refused"}})
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "error": {"message": "handshake refused"},
+                },
+            )
         return httpx.Response(202)
 
     adapter = DataHubMCPAdapter(
         endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(handler)
     )
-    assert adapter.fetch_context("urn:x").integration.status is IntegrationStatus.FAILED
+    assert adapter.fetch_context(MCP_ASSET_URN).integration.status is IntegrationStatus.FAILED
+
+
+def test_mcp_rejects_unsupported_negotiated_protocol() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "old-server", "version": "1"},
+                },
+            },
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(handler)
+    )
+    result = adapter.fetch_context(MCP_ASSET_URN)
+
+    assert result.integration.status is IntegrationStatus.FAILED
+    assert "unsupported protocol version" in result.integration.message
+
+
+def test_mcp_rejects_json_rpc_response_for_a_different_request() -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 999,
+                "result": {"structuredContent": _official_mcp_payload("get_entities")},
+            },
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc",
+        transport=httpx.MockTransport(_mcp_handshake(call)),
+    )
+    result = adapter.fetch_context(MCP_ASSET_URN)
+
+    assert result.integration.status is IntegrationStatus.FAILED
+    assert "does not match request id" in result.integration.message
 
 
 # --------------------------------------------------------------------------- #
@@ -506,6 +1612,36 @@ def test_raise_incident_without_urn_is_failure() -> None:
         asset_urn="urn:li:dataset:test", case_id="DR-1", description="drift"
     )
     assert result.status is IntegrationStatus.FAILED
+
+
+def test_raise_incident_requires_remote_active_readback() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "value": {
+                        "entities": ["urn:li:dataset:test"],
+                        "title": "DataRescue schema drift DR-1",
+                        "status": {"state": "RESOLVED"},
+                    }
+                },
+            )
+        return httpx.Response(200, json={"data": {"raiseIncident": "urn:li:incident:1"}})
+
+    adapter = DataHubGraphQLAdapter(
+        gms_url="https://datahub.test",
+        transport=httpx.MockTransport(handler),
+        readback_attempts=1,
+        readback_delay_seconds=0,
+    )
+
+    result = adapter.raise_incident(
+        asset_urn="urn:li:dataset:test", case_id="DR-1", description="drift"
+    )
+
+    assert result.status is IntegrationStatus.FAILED
+    assert "read-back" in result.message
 
 
 # --------------------------------------------------------------------------- #
@@ -637,10 +1773,7 @@ def test_watcher_skips_non_schema_signals(key: str, value: str) -> None:
 def test_watcher_fails_on_unsupported_content_type_and_missing_fields() -> None:
     avro = _drift_mcl()
     avro["aspect"] = {"contentType": "application/avro", "value": "..."}
-    assert (
-        DataHubSchemaMCLWatcher(lambda event: None).handle(avro).status
-        is MCLActionStatus.FAILED
-    )
+    assert DataHubSchemaMCLWatcher(lambda event: None).handle(avro).status is MCLActionStatus.FAILED
     no_fields = _drift_mcl()
     no_fields["aspect"] = {"contentType": "application/json", "value": json.dumps({"nope": []})}
     assert (

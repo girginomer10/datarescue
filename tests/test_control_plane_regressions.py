@@ -11,6 +11,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import apps.api.workflow as workflow_module
+from apps.api.cli import CONTAINED_EXIT_CODE
+from apps.api.cli import main as cli_main
 from apps.api.main import SQLITE_MAX_INTEGER, create_app
 from apps.api.models import (
     CandidateProposal,
@@ -435,6 +437,85 @@ def test_duplicate_delivery_bypasses_a_long_running_worker_lock(tmp_path: Path) 
     assert duplicate_response.deduplicated is True
 
 
+def test_redelivery_after_restart_resumes_a_detected_checkpoint_and_guard_blocks_it(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path)
+    workflow = WorkflowService(settings)
+    event = _schema_event(event_id="restart-after-detected")
+
+    def crash_after_detection(*, case_id: str, event: SchemaChangeEvent) -> None:
+        del case_id, event
+        raise SystemExit("simulated process termination")
+
+    workflow._advance = crash_after_detection  # type: ignore[method-assign]
+    with pytest.raises(SystemExit, match="simulated process termination"):
+        workflow.ingest(event)
+
+    stranded = workflow.store.list_cases()[0]
+    assert stranded.state.value == "DETECTED"
+    assert cli_main(
+        [
+            "guard",
+            "--asset",
+            DEFAULT_ASSET_URN,
+            "--database-path",
+            str(settings.resolved_database_path),
+            "--",
+            "python",
+            "-c",
+            "raise SystemExit('must not run')",
+        ]
+    ) == CONTAINED_EXIT_CODE
+
+    restarted = WorkflowService(settings)
+    resumed = restarted.ingest(event)
+
+    assert resumed.deduplicated is True
+    assert resumed.case.state.value == "PATCH_READY"
+    event_types = [item.event_type.value for item in resumed.case.events]
+    assert event_types.count("SCHEMA_CHANGE_DETECTED") == 1
+    assert event_types.count("INCIDENT_RAISED") == 1
+    assert event_types.count("CONTEXT_GATHERED") == 1
+
+    patch_retry = WorkflowService(settings).ingest(event)
+    assert patch_retry.case.state.value == "PATCH_READY"
+    assert patch_retry.case.selected_candidate is not None
+    assert patch_retry.case.selected_candidate.source_field == "net_amount"
+    assert not any(
+        item.event_type.value == "CONTAINED" for item in patch_retry.case.events
+    )
+
+
+class _CrashAfterContextCandidates:
+    def propose(self, event: object, context: object) -> object:
+        del event, context
+        raise SystemExit("simulated termination after context checkpoint")
+
+
+def test_redelivery_after_restart_resumes_from_the_last_durable_stage(
+    tmp_path: Path,
+) -> None:
+    settings = make_test_settings(tmp_path)
+    event = _schema_event(event_id="restart-after-context")
+    workflow = WorkflowService(
+        settings,
+        candidates=_CrashAfterContextCandidates(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SystemExit, match="after context checkpoint"):
+        workflow.ingest(event)
+    assert workflow.store.list_cases()[0].state.value == "CONTEXT_GATHERED"
+
+    resumed = WorkflowService(settings).ingest(event)
+
+    assert resumed.deduplicated is True
+    assert resumed.case.state.value == "PATCH_READY"
+    event_types = [item.event_type.value for item in resumed.case.events]
+    assert event_types.count("INCIDENT_RAISED") == 1
+    assert event_types.count("CONTEXT_GATHERED") == 1
+
+
 def _git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
         ["git", *arguments],
@@ -643,6 +724,48 @@ def test_commit_outside_fetched_origin_base_history_is_rejected(
 
     assert response.status_code == 409
     assert unchanged["state"] == "PR_OPEN"
+    assert executor.bound_checkouts == []
+
+
+def test_old_patch_ancestor_is_rejected_after_origin_base_reverts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository, model = _verified_repository(tmp_path)
+    monkeypatch.setattr(
+        workflow_module,
+        "_github_repository_from_remote_url",
+        lambda url: "girginomer10/datarescue",
+    )
+    executor = _CheckoutRecordingExecutor()
+    settings, workflow = _verified_workflow(tmp_path, repository, executor)
+
+    with TestClient(create_app(settings, workflow)) as client:  # type: ignore[arg-type]
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+        patch_commit = _commit_and_push(
+            repository,
+            model,
+            case["patch"]["content"],
+            "merge exact validated patch",
+        )
+        _git(repository, "revert", "--no-edit", patch_commit)
+        _git(repository, "push", "origin", "main")
+
+        response = client.post(
+            f"/api/v1/cases/{case['id']}/verify-deployment",
+            json={
+                **_good_verification_payload(),
+                "merged_commit_sha": patch_commit,
+            },
+        )
+        unchanged = client.get(f"/api/v1/cases/{case['id']}").json()
+
+    assert response.status_code == 409
+    assert "exactly match" in response.json()["detail"]
+    assert unchanged["state"] == "PR_OPEN"
+    assert unchanged["incident_status"] == "ACTIVE"
+    assert "DEPLOYMENT_RECORDED" not in [
+        event["event_type"] for event in unchanged["events"]
+    ]
     assert executor.bound_checkouts == []
 
 

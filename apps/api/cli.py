@@ -15,7 +15,9 @@ CONTAINED_EXIT_CODE = 75
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="datarescue")
     subcommands = parser.add_subparsers(dest="subcommand", required=True)
-    guard = subcommands.add_parser("guard", help="Block a command when an asset is contained")
+    guard = subcommands.add_parser(
+        "guard", help="Block a command while an asset has an unresolved drift case"
+    )
     guard.add_argument("--asset", required=True, help="Exact DataHub asset URN")
     guard.add_argument("--database-path", type=Path, help="Override the event-store path")
     guard.add_argument("command", nargs=argparse.REMAINDER, help="Command after --")
@@ -28,11 +30,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     settings = Settings(database_path=args.database_path) if args.database_path else Settings()
     store = EventStore(settings.resolved_database_path)
-    contained = store.contained_asset(args.asset)
-    if contained:
+    blocked = store.blocked_asset(args.asset)
+    if blocked:
         print(
-            f"DataRescue blocked downstream execution: {args.asset} is contained "
-            f"by {contained.id}",
+            f"DataRescue blocked downstream execution: {args.asset} is unsafe "
+            f"in {blocked.state.value} case {blocked.id}",
             file=sys.stderr,
         )
         return CONTAINED_EXIT_CODE

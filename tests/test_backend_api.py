@@ -100,6 +100,21 @@ def test_connected_mode_requires_a_real_datahub_incident(tmp_path: Path) -> None
     assert case["candidates"] == []
     assert case["pull_request"] is None
 
+    result = cli_main(
+        [
+            "guard",
+            "--asset",
+            DEFAULT_ASSET_URN,
+            "--database-path",
+            str(settings.resolved_database_path),
+            "--",
+            "python",
+            "-c",
+            "raise SystemExit('must not run after a failed safety workflow')",
+        ]
+    )
+    assert result == CONTAINED_EXIT_CODE
+
 
 def test_fail_closed_scenario_activates_guard_exit_75(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path)

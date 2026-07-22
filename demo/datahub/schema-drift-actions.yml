@@ -1,9 +1,9 @@
-name: datarescue-schema-drift
+name: ${DATAHUB_ACTIONS_GROUP:-datarescue-schema-drift}
 enabled: true
 
-# DataHub Core v1.6 Quickstart exposes these endpoints on the host by default.
-# The connected runner exports explicit values and never attempts to guess a
-# Docker network or container name.
+# DataHub Core v1.6 Quickstart exposes Kafka on the host and proxies its
+# internal Schema Registry through GMS. The connected runner exports explicit
+# values and never attempts to guess a Docker network or container name.
 source:
   type: kafka
   config:

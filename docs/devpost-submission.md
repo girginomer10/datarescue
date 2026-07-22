@@ -68,12 +68,17 @@ as a live external action.
 
 ## Accomplishments
 
-- A full drift-to-draft-PR vertical slice with a human merge boundary
+- Bounded live proofs for automatic MCL intake, remotely verified active
+  incidents, restart-safe deduplication, official MCP context, and persisted
+  DataHub evidence write-back
+- A fail-closed connected launcher that, when external credentials are
+  configured, accepts success only at `PR_OPEN` with the human merge boundary
+  still intact
 - Exact, reproducible `+3.40%` versus `0.00%` candidate reconciliation
 - Fail-closed containment with an executable downstream guard
 - Idempotent MCL handling and append-only incident evidence
-- Post-merge verification that recomputes evidence instead of trusting caller
-  metrics
+- An exact-SHA post-merge verification path that recomputes evidence instead of
+  trusting caller metrics; exercising it still requires an authorized merge
 - A judge-readable Forensic Console where mint green is reserved for proven
   results
 
@@ -101,7 +106,16 @@ CLI · Docker
 
 - `make demo`: real PostgreSQL/dbt evidence with clearly labelled recorded
   DataHub context, designed for a reliable local judging run.
-- `make demo-connected`: fail-fast connected path for a configured DataHub Core,
-  Actions consumer, MCP endpoint, and GitHub credentials.
+- `make demo-connected`: fail-fast connected path requiring an OpenAI key,
+  authenticated GitHub CLI, and repository target. It manages the pinned
+  official MCP server on loopback by default; an external MCP endpoint is
+  optional and must use HTTPS plus its own token. The command waits for one live
+  MCL case to reach `PR_OPEN` with the incident still `ACTIVE`; it never merges,
+  deploys, or represents post-deploy resolution as complete.
 - Hosted console: hash-verified recorded evidence; no external mutation is
   represented as live.
+
+The credential-free live proofs stop before OpenAI proposal generation and the
+GitHub write. A complete MCL → OpenAI → draft-PR run therefore remains an
+environment-dependent release proof, and human merge plus exact-SHA
+post-deployment verification remains a separate authorized step.

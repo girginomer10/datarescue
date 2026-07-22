@@ -35,7 +35,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-datarescue}
       POSTGRES_USER: ${POSTGRES_USER:-datarescue}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-datarescue}
-      DATAHUB_GMS_URL: ${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:8080}
+      DATAHUB_GMS_URL: ${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:18080}
       DATAHUB_TOKEN: ${DATAHUB_TOKEN:-}
     extra_hosts:
       - host.docker.internal:host-gateway
@@ -45,19 +45,20 @@ services:
     restart: "no"
 
   # Optional dbt metadata runner. Generate target artifacts first with
-  # `make dbt-artifacts`, then invoke this service through the Makefile.
+  # `make dbt-artifacts`, then mount only that immutable artifact directory.
   datahub-ingest-dbt:
     image: ${DATAHUB_INGESTION_IMAGE:-acryldata/datahub-ingestion:v1.6.0}
     profiles: ["datahub"]
     environment:
-      DATAHUB_GMS_URL: ${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:8080}
+      DATAHUB_GMS_URL: ${DATAHUB_GMS_URL_CONTAINER:-http://host.docker.internal:18080}
       DATAHUB_TOKEN: ${DATAHUB_TOKEN:-}
-      DBT_ARTIFACT_ROOT: /workspace/demo/dbt/target
+      DBT_ARTIFACT_ROOT: /artifacts
     extra_hosts:
       - host.docker.internal:host-gateway
     volumes:
-      - ./:/workspace:ro
-    command: ["ingest", "run", "-c", "/workspace/demo/datahub/dbt-ingestion.yml"]
+      - ${DBT_ARTIFACT_ROOT_HOST:-./demo/dbt/target}:/artifacts:ro
+      - ./demo/datahub:/recipes:ro
+    command: ["ingest", "run", "-c", "/recipes/dbt-ingestion.yml"]
     restart: "no"
 
 volumes:

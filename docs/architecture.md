@@ -51,7 +51,20 @@ env: PROD
 convert_urns_to_lowercase: true
 ```
 
-The Postgres recipe declares `platform_instance: datarescue-demo`, and the dbt source mirrors that identity with `target_platform: postgres`, `target_platform_instance: datarescue-demo`, and `include_database_name: true`. This keeps physical and dbt metadata aligned to the same asset identity.
+Both recipes intentionally leave platform instance unset. The dbt source uses
+`target_platform: postgres` and `include_database_name: true`, producing the
+same canonical physical URN as PostgreSQL ingestion:
+
+```text
+urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)
+```
+
+The connected bootstrap verifies four semantic edges before MCP context is
+trusted: physical source → dbt source, dbt source → dbt staging, dbt staging →
+materialized PostgreSQL staging, and materialized staging → dbt mart. DataHub's
+native dbt ingestion also emits a physical source → materialized staging edge;
+that single parallel edge is explicitly allowlisted. Other shortcuts, missing
+edges, or a flattened star topology fail the contract.
 
 ## Recovery policy
 
@@ -63,9 +76,42 @@ The default policy requires current semantic evidence, a successful dbt build, t
 - **Local live (`make demo`):** recorded DataHub context with real PostgreSQL/dbt candidate execution. External operations remain explicitly labeled.
 - **Connected (`make demo-connected`):** real DataHub MCL/MCP/GraphQL, OpenAI proposals, PostgreSQL/dbt execution, and GitHub draft PR. Required endpoints and credentials fail fast; the launcher forces `replay=false` and `execution=postgres`.
 
+After drift ingestion, the connected launcher runs a bounded proof over exactly
+one current case. It succeeds only when the live MCL path reaches `PR_OPEN`, the
+wrong gross candidate is rejected, the net candidate is selected from real dbt
+evidence, evidence write-back is verified, and the remote incident remains
+`ACTIVE`. This boundary deliberately excludes human merge, deployment, and
+exact-commit post-deploy resolution.
+
+The connected launcher owns a pinned official DataHub MCP v0.6 HTTP process on
+loopback unless an explicit external HTTPS endpoint is supplied. External MCP
+authentication uses a separate token; the DataHub GMS credential is never
+forwarded. Its composite context read uses `get_entities`, `list_schema_fields`,
+and directed `get_lineage` calls; evidence write-back uses mutation-gated
+`save_document` followed by an exact GMS `documentInfo` read-back. This direct
+read verifies the persisted title, content, and related asset without relying
+on a capped related-document page returned for the asset. Incident mutations
+are held to the same standard: raise and resolve are successful only after GMS
+`incidentInfo` reports the expected remote `ACTIVE` or `RESOLVED` state and
+identity. The canonical asset is accepted only when the verified owner,
+deterministic context document, complete schema, and required directed lineage
+topology are present in the live responses.
+
 The connected launcher never infers Kafka topology. It uses the explicit host
-ports published by the pinned DataHub v1.6 Quickstart or caller-provided
-`DATAHUB_KAFKA_BOOTSTRAP` and `DATAHUB_SCHEMA_REGISTRY_URL` values. The API must
+Kafka port and the internal Schema Registry proxy exposed through the pinned
+DataHub v1.6 GMS, or caller-provided `DATAHUB_KAFKA_BOOTSTRAP` and
+`DATAHUB_SCHEMA_REGISTRY_URL` values. The API must
 report healthy PostgreSQL mode before the Actions process starts, and schema
 drift is not applied until Kafka reports an assigned member in the Actions MCL
 consumer group.
+
+Launcher health is also process-owned evidence: the configured loopback port
+must be free before startup, and the spawned API must echo a per-run nonce plus
+a digest of the intended state-database path before it is trusted. Candidate dbt
+builds use private target directories, and reconciliation reads the exact
+`<candidate_schema>.fct_revenue` relation that dbt built. A zero dbt exit code is
+not evidence on its own: missing or malformed `run_results.json`, the wrong
+invocation type, absent expected models/tests, or any non-success node fails
+closed. DataHub artifacts are built into a unique complete snapshot, held
+unchanged and mounted read-only for the lifetime of the ingestion consumer, so
+another build cannot substitute its run result, manifest, or catalog.
