@@ -34,8 +34,10 @@ from apps.api.models import (
 )
 from apps.api.workflow import DEFAULT_ASSET_URN, WorkflowService
 from packages.datahub.actions import DataHubSchemaMCLWatcher, DataRescueSchemaAction
-from packages.evidence.executor import CandidateExecution
+from packages.datahub.mcp import MCPContextResult
+from packages.evidence.executor import CandidateExecution, ReplayEvidenceExecutor
 from packages.policy import PolicyEngine
+from packages.remediation.candidates import CandidateGenerationResult
 from packages.remediation.github import GitHubDraftPRAdapter
 from packages.remediation.sql_safety import SQLSafetyError, render_dbt_patch
 from tests.backend_helpers import REPO_ROOT, make_test_settings
@@ -335,6 +337,227 @@ def test_datahub_action_create_validates_config() -> None:
         DataRescueSchemaAction.create({"api_url": "http://x", "request_timeout_seconds": 600})
     action = DataRescueSchemaAction.create({"api_url": "http://x", "request_timeout_seconds": 5})
     assert isinstance(action, DataRescueSchemaAction)
+
+
+# --------------------------------------------------------------------------- #
+# Incident / post-deploy honesty and connected-mode containment
+# --------------------------------------------------------------------------- #
+
+_GLOSSARY = "Recognized revenue is the net settled amount after processing fees."
+
+
+class _SuccessfulIncidents:
+    def raise_incident(
+        self, *, asset_urn: str, case_id: str, description: str
+    ) -> IntegrationResult:
+        return IntegrationResult(
+            status=IntegrationStatus.SUCCEEDED,
+            operation="raise_incident",
+            message="raised",
+            resource_id=f"urn:li:incident:{case_id}",
+        )
+
+    def resolve_incident(self, *, incident_urn: str) -> IntegrationResult:
+        return IntegrationResult(
+            status=IntegrationStatus.SUCCEEDED,
+            operation="resolve_incident",
+            message="resolved",
+            resource_id=incident_urn,
+        )
+
+
+class _ResolveFailsIncidents(_SuccessfulIncidents):
+    def resolve_incident(self, *, incident_urn: str) -> IntegrationResult:
+        return IntegrationResult(
+            status=IntegrationStatus.FAILED,
+            operation="resolve_incident",
+            message="incident resolution refused",
+            resource_id=incident_urn,
+        )
+
+
+def _context_result(glossary: str | None = _GLOSSARY) -> MCPContextResult:
+    return MCPContextResult(
+        integration=IntegrationResult(
+            status=IntegrationStatus.SUCCEEDED, operation="fetch_context", message="ctx"
+        ),
+        context={
+            "glossary_definition": glossary,
+            "owner": "Finance",
+            "lineage_urns": [DEFAULT_ASSET_URN],
+            "context_documents": ["urn:li:glossaryTerm:NetRevenue"],
+            "lineage_current": True,
+        },
+    )
+
+
+class _ValidContextMCP:
+    def fetch_context(self, asset_urn: str) -> MCPContextResult:
+        return _context_result()
+
+    def write_evidence_report(self, **kwargs: object) -> IntegrationResult:
+        return IntegrationResult(
+            status=IntegrationStatus.SUCCEEDED, operation="mcp_write_evidence", message="ok"
+        )
+
+
+class _NoGlossaryMCP(_ValidContextMCP):
+    def fetch_context(self, asset_urn: str) -> MCPContextResult:
+        return _context_result(glossary=None)
+
+
+class _WritebackFailsOnRecovered(_ValidContextMCP):
+    def write_evidence_report(
+        self, *, asset_urn: str, case_id: str, report: dict[str, object], degraded: bool
+    ) -> IntegrationResult:
+        if report.get("decision") == "RECOVERED":
+            return IntegrationResult(
+                status=IntegrationStatus.FAILED,
+                operation="mcp_write_evidence",
+                message="final write-back failed",
+            )
+        return IntegrationResult(
+            status=IntegrationStatus.SUCCEEDED, operation="mcp_write_evidence", message="ok"
+        )
+
+
+class _EmptyCandidates:
+    def propose(self, event: object, context: object) -> CandidateGenerationResult:
+        return CandidateGenerationResult(
+            candidates=[],
+            integration=IntegrationResult(
+                status=IntegrationStatus.SUCCEEDED,
+                operation="candidate_generation",
+                message="no candidate",
+            ),
+        )
+
+
+def _good_verify_body() -> dict[str, object]:
+    return {
+        "merged_commit_sha": "abcdef1",
+        "semantic_verdict": "MATCH",
+        "lineage_current": True,
+        "reconciliation": {
+            "total_variance_pct": 0.0,
+            "row_count_variance_pct": 0.0,
+            "primary_key_overlap_pct": 100.0,
+            "null_rate_delta_percentage_points": 0.0,
+        },
+        "build": {"passed": True, "passed_checks": 8, "total_checks": 8},
+    }
+
+
+def test_ingest_records_a_durable_non_leaking_failed_event(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    model_dir = repo / "demo/dbt/models/staging"
+    model_dir.mkdir(parents=True)
+    # No allowlisted amount default, so render_dbt_patch raises inside _advance.
+    (model_dir / "stg_payments.sql").write_text(
+        "select payment_id, amount as revenue from x", encoding="utf-8"
+    )
+    settings = make_test_settings(tmp_path, github_repo_root=repo)
+    with TestClient(create_app(settings)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+    assert case["state"] == "FAILED"
+    failed = next(event for event in case["events"] if event["event_type"] == "FAILED")
+    assert failed["payload"]["error_type"]
+    assert "inspect server logs" in failed["payload"]["message"]
+    assert str(repo) not in failed["payload"]["message"]
+
+
+def test_post_deploy_writeback_failure_keeps_incident_active(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path)
+    workflow = WorkflowService(
+        settings,
+        incidents=_SuccessfulIncidents(),  # type: ignore[arg-type]
+        mcp=_WritebackFailsOnRecovered(),  # type: ignore[arg-type]
+        github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
+    )
+    with TestClient(create_app(settings, workflow)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+        assert case["state"] == "PR_OPEN"
+        recovered = client.post(
+            f"/api/v1/cases/{case['id']}/verify-deployment", json=_good_verify_body()
+        ).json()
+    assert recovered["state"] == "FAILED"
+    assert recovered["incident_status"] == "ACTIVE"
+    assert "INCIDENT_RESOLVED" not in [event["event_type"] for event in recovered["events"]]
+
+
+def test_post_deploy_resolution_failure_keeps_incident_active(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path)
+    workflow = WorkflowService(
+        settings,
+        incidents=_ResolveFailsIncidents(),  # type: ignore[arg-type]
+        mcp=_ValidContextMCP(),  # type: ignore[arg-type]
+        github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
+    )
+    with TestClient(create_app(settings, workflow)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+        assert case["state"] == "PR_OPEN"
+        recovered = client.post(
+            f"/api/v1/cases/{case['id']}/verify-deployment", json=_good_verify_body()
+        ).json()
+    assert recovered["state"] == "FAILED"
+    assert recovered["incident_status"] == "ACTIVE"
+
+
+def test_connected_mode_contains_when_glossary_is_missing(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path, replay_mode=False)
+    workflow = WorkflowService(
+        settings,
+        incidents=_SuccessfulIncidents(),  # type: ignore[arg-type]
+        mcp=_NoGlossaryMCP(),  # type: ignore[arg-type]
+    )
+    with TestClient(create_app(settings, workflow)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+    assert case["state"] == "CONTAINED"
+    assert case["containment_reasons"]
+
+
+def test_connected_mode_contains_when_no_candidate_exists(tmp_path: Path) -> None:
+    settings = make_test_settings(tmp_path, replay_mode=False)
+    workflow = WorkflowService(
+        settings,
+        incidents=_SuccessfulIncidents(),  # type: ignore[arg-type]
+        mcp=_ValidContextMCP(),  # type: ignore[arg-type]
+        candidates=_EmptyCandidates(),  # type: ignore[arg-type]
+    )
+    with TestClient(create_app(settings, workflow)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+    assert case["state"] == "CONTAINED"
+    assert any("candidate" in reason.lower() for reason in case["containment_reasons"])
+
+
+def test_live_post_deploy_rejects_a_merge_without_the_validated_mapping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_test_settings(tmp_path, execution_mode="postgres")
+    workflow = WorkflowService(
+        settings,
+        github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
+        executor=ReplayEvidenceExecutor(),  # type: ignore[arg-type]
+    )
+    # The merged model as returned by `git show` still has the pre-drift default,
+    # i.e. it does NOT contain the validated net_amount mapping.
+    unpatched = (settings.github_repo_root / settings.github_patch_path).read_text(
+        encoding="utf-8"
+    )
+
+    def fake_git(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        stdout = unpatched if command[1] == "show" else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_git)
+    with TestClient(create_app(settings, workflow)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+        assert case["state"] == "PR_OPEN"
+        response = client.post(
+            f"/api/v1/cases/{case['id']}/verify-deployment", json=_good_verify_body()
+        )
+    assert response.status_code == 409
+    assert client.get(f"/api/v1/cases/{case['id']}").json()["state"] == "PR_OPEN"
 
 
 def test_datahub_action_raises_on_malformed_event_for_redelivery() -> None:
