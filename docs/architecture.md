@@ -44,15 +44,14 @@ The store rejects invalid transitions and retains an append-only event record so
 
 ## DataHub identity
 
-Postgres and dbt ingestion recipes share:
+Both ingestion recipes share:
 
 ```yaml
 env: PROD
 convert_urns_to_lowercase: true
-platform_instance: datarescue-demo
 ```
 
-The dbt source additionally declares `target_platform: postgres`, `target_platform_instance: datarescue-demo`, and `include_database_name: true`. This keeps physical and dbt metadata aligned to the same asset identity.
+The Postgres recipe declares `platform_instance: datarescue-demo`, and the dbt source mirrors that identity with `target_platform: postgres`, `target_platform_instance: datarescue-demo`, and `include_database_name: true`. This keeps physical and dbt metadata aligned to the same asset identity.
 
 ## Recovery policy
 

@@ -39,3 +39,43 @@
 - Verified: Shell syntax, Ruff, local `make test-demo`, memory sync, and memory doctor passed. Fresh GitHub run `29929649811` then passed both `quality` and `postgres-dbt-proof`; Pages run `29929650837` also passed.
 - Memory: Added `memory/bugfixes/postgres-entrypoint-readiness-race.md`; do not replace final-server readiness with a single `pg_isready` probe.
 - Next: Resume the completion roadmap at the real DataHub MCL-to-incident path; do not expand UI scope first.
+
+## 2026-07-22 - Automated L6 quality and hardening pass
+
+- Task: Autonomous quality pass over the published MVP. Did not touch the
+  connected/credential-dependent gates (real DataHub/OpenAI/GitHub); focused on
+  the "definition of done" item 10 — robustness, security, honesty, coverage.
+- Verified baseline first: 23 Python tests, 13 web tests, web build, replay
+  hash verification, ruff, mypy --strict, memory reindex/doctor, and the live
+  PostgreSQL/dbt workflow proof (gross +3.40% rejected, net 0.00% selected)
+  all green in this environment.
+- Ran an adversarial multi-dimension audit (correctness, security, edge cases,
+  frontend, test-coverage, doc-drift) and independently reproduced each fix.
+- Changed (all with regression tests; suite grew 23 → 119 Python + 14 web):
+  - Serialized ingest, demo reset, and verify_deployment under the single
+    worker lock; before this a reset could interleave mid-ingest and split a
+    case's event stream across dedup scopes, permanently 500-ing list/get.
+  - store.append resolves an (event_id, reset_scope) collision to a
+    DuplicateEventError instead of a raw sqlite3.IntegrityError 500.
+  - MCL intake: non-object payloads and out-of-range timestamps fail gracefully;
+    an out-of-allowlist asset is SKIPPED, not a 500; missing case id serializes
+    as null.
+  - Executor: delete stale run_results.json before dbt; bound every psycopg
+    connection with connect + statement timeouts.
+  - GitHub: clean up the local branch + self-heal an orphaned worktree so
+    retries work; stop leaking resolved paths in the persisted failure message.
+  - SSE honors Last-Event-ID on reconnect and bounds a follow connection.
+  - Aligned validate_candidate_sql's alias rule with render_candidate_sql.
+  - Web: labeled-region a11y (SectionHeading titleId), lineage tab panels stay
+    mounted, coupled lineage node/edge fallbacks, timeout NaN guard, poll-error
+    resilience, slugified incident-state class.
+  - Docs: fixed the shared-recipe platform_instance claim in architecture.md
+    and documented the untracked DATARESCUE_ settings in .env.example.
+- Deliberately NOT changed (design-level / user-infra-dependent, documented for
+  a human decision): adding API authentication; the replay-mode post-deploy
+  trust model (postgres mode already recomputes and verifies the merge SHA);
+  replacing the free-text semantic-verdict substring match with a structured
+  glossary-term binding.
+- Memory: added `memory/bugfixes/workflow-writer-serialization.md`.
+- Next: the connected vertical slice (real DataHub Core/Kafka/MCP/GraphQL +
+  live OpenAI + human merge) remains the outstanding completion gate.
