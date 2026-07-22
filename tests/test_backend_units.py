@@ -36,7 +36,9 @@ from apps.api.models import (
 from apps.api.state_machine import ALLOWED_TRANSITIONS, InvalidStateTransition, validate_transition
 from apps.api.workflow import DEFAULT_ASSET_URN
 from packages.datahub.actions import (
+    DataHubSchemaMCLWatcher,
     HTTPEventSink,
+    MCLActionStatus,
     _event_payload,
     _observed_at,
     _same_schema,
@@ -228,6 +230,45 @@ def test_replay_executor_fails_closed_for_unrecognized_candidate() -> None:
     assert execution.reconciliation.primary_key_overlap_pct == 0.0
 
 
+def test_run_dbt_never_reports_a_prior_candidates_stale_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import subprocess
+
+    from packages.evidence.executor import PostgresDbtExecutor
+
+    project = tmp_path / "dbt"
+    (project / "target").mkdir(parents=True)
+    stale = project / "target" / "run_results.json"
+    stale.write_text(
+        json.dumps(
+            {
+                "results": [
+                    {"unique_id": "test.prior", "status": "pass"},
+                    {"unique_id": "model.prior", "status": "success"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    executor = PostgresDbtExecutor(
+        postgres_dsn="postgresql://unused",
+        dbt_project_dir=project,
+        dbt_profiles_dir=project,
+    )
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        # A compile/parse failure exits non-zero WITHOUT rewriting run_results.json.
+        return subprocess.CompletedProcess([], 1, stdout="", stderr="compile error")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = executor._run_dbt(schema="candidate_x", source_field="net_amount")
+
+    assert result.passed is False
+    assert result.passed_checks == 0
+    assert result.total_checks == 0
+
+
 # --------------------------------------------------------------------------- #
 # DataHub MCP adapter (mocked transport, no network)
 # --------------------------------------------------------------------------- #
@@ -400,6 +441,50 @@ def test_event_payload_normalizes_serialized_pegasus_events() -> None:
         _event_payload(object())
 
 
+_MCL_URN = "urn:li:dataset:(urn:li:dataPlatform:postgres,x.raw.y,PROD)"
+
+
+def _drift_mcl(urn: str = _MCL_URN) -> dict[str, object]:
+    def fields(names: list[str]) -> str:
+        return json.dumps({"fields": [{"fieldPath": name} for name in names]})
+
+    return {
+        "entityType": "dataset",
+        "aspectName": "schemaMetadata",
+        "entityUrn": urn,
+        "previousAspectValue": {
+            "contentType": "application/json",
+            "value": fields(["payment_id", "amount"]),
+        },
+        "aspect": {
+            "contentType": "application/json",
+            "value": fields(["payment_id", "gross_amount", "net_amount"]),
+        },
+    }
+
+
+def test_watcher_rejects_non_object_payloads() -> None:
+    watcher = DataHubSchemaMCLWatcher(lambda event: None)
+    for payload in (123, "drift", [1, 2, 3]):
+        result = watcher.handle(payload)  # type: ignore[arg-type]
+        assert result.status is MCLActionStatus.FAILED
+
+
+def test_watcher_skips_when_sink_rejects_an_out_of_scope_asset() -> None:
+    def rejecting_sink(event: SchemaChangeEvent) -> object:
+        raise PermissionError("outside allowlist")
+
+    watcher = DataHubSchemaMCLWatcher(rejecting_sink)
+    result = watcher.handle(_drift_mcl())
+    assert result.status is MCLActionStatus.SKIPPED
+    assert "allowlist" in result.reason.lower()
+
+
+def test_observed_at_falls_back_on_out_of_range_timestamp() -> None:
+    observed = _observed_at({"created": {"time": 10**20}})
+    assert observed.tzinfo is UTC  # a sane fallback, not a crash
+
+
 def test_http_event_sink_posts_and_reads_case_reference() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/v1/events/schema-change"
@@ -497,3 +582,114 @@ def test_project_case_requires_a_schema_change_detected_root() -> None:
     )
     with pytest.raises(ValueError):
         project_case([orphan])
+
+
+# --------------------------------------------------------------------------- #
+# GitHub draft-PR worktree cleanup (retry safety)
+# --------------------------------------------------------------------------- #
+
+
+def _git(repo: Path, *args: str) -> str:
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def test_worktree_cleanup_deletes_leaked_branch_for_retry_safety(tmp_path: Path) -> None:
+    from packages.remediation.github import GitHubDraftPRAdapter
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    _git(repo, "commit", "--allow-empty", "-m", "init")
+
+    adapter = GitHubDraftPRAdapter(
+        enabled=True,
+        repository="girginomer10/datarescue",
+        repo_root=repo,
+        base_branch="main",
+        patch_path="demo/dbt/models/staging/stg_payments.sql",
+        runtime_dir=tmp_path / "runtime",
+    )
+    worktree = tmp_path / "runtime" / "worktrees" / "dr-x"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    branch = "datarescue/dr-x"
+    _git(repo, "worktree", "add", "-b", branch, str(worktree), "main")
+    assert branch in _git(repo, "branch", "--list", branch)
+
+    adapter._cleanup_worktree(worktree, branch)
+
+    # The worktree and the leaked branch ref are both gone...
+    assert not worktree.exists()
+    assert _git(repo, "branch", "--list", branch) == ""
+    # ...so a retry for the same case can re-create the branch cleanly.
+    _git(repo, "worktree", "add", "-b", branch, str(worktree), "main")
+    assert branch in _git(repo, "branch", "--list", branch)
+
+
+# --------------------------------------------------------------------------- #
+# Single-writer serialization
+# --------------------------------------------------------------------------- #
+
+
+def test_reset_is_serialized_under_the_worker_lock(tmp_path: Path) -> None:
+    import threading
+
+    from apps.api.workflow import WorkflowService
+
+    workflow = WorkflowService(make_test_settings(tmp_path))
+    # Hold the single-writer lock as if an ingest were mid-flight.
+    assert workflow._worker_lock.acquire()
+    done = threading.Event()
+    captured: dict[str, int] = {}
+
+    def run_reset() -> None:
+        captured["sequence"] = workflow.reset()
+        done.set()
+
+    worker = threading.Thread(target=run_reset)
+    worker.start()
+    try:
+        # A reset must not interleave within a held write; it blocks on the lock.
+        assert done.wait(0.3) is False
+    finally:
+        workflow._worker_lock.release()
+    assert done.wait(2.0) is True
+    worker.join()
+    assert isinstance(captured["sequence"], int)
+
+
+def test_append_treats_event_id_collision_as_a_duplicate(tmp_path: Path) -> None:
+    from apps.api.models import EventType
+    from apps.api.store import DuplicateEventError, EventStore
+
+    store = EventStore(tmp_path / "state.sqlite3")
+    payload = {"schema_change": {}, "incident_urn": "urn:li:dataRescueIncident:DR-A"}
+    store.append(
+        case_id="DR-A",
+        event_type=EventType.SCHEMA_CHANGE_DETECTED,
+        state=CaseState.DETECTED,
+        payload=payload,
+        dedup_key="dedup-a",
+        event_id="shared-event-id",
+    )
+
+    # A different case body reusing the same event_id trips the (event_id,
+    # reset_scope) index; it must surface as a duplicate, not a raw 500.
+    with pytest.raises(DuplicateEventError) as excinfo:
+        store.append(
+            case_id="DR-B",
+            event_type=EventType.SCHEMA_CHANGE_DETECTED,
+            state=CaseState.DETECTED,
+            payload={"schema_change": {}, "incident_urn": "urn:li:dataRescueIncident:DR-B"},
+            dedup_key="dedup-b",
+            event_id="shared-event-id",
+        )
+    assert excinfo.value.case_id == "DR-A"

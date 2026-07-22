@@ -149,14 +149,23 @@ class EventStore:
                     ),
                 )
             except sqlite3.IntegrityError as error:
-                if dedup_key is None:
-                    raise
-                existing = connection.execute(
-                    "SELECT case_id FROM events WHERE dedup_key = ? AND reset_scope = ?",
-                    (dedup_key, scope),
+                # Either unique index — (dedup_key, reset_scope) or
+                # (event_id, reset_scope) — can raise. Both mean an idempotent
+                # duplicate of an existing case, never a crash: resolve to that
+                # case instead of leaking a raw IntegrityError as a 500.
+                if dedup_key is not None:
+                    existing = connection.execute(
+                        "SELECT case_id FROM events WHERE dedup_key = ? AND reset_scope = ?",
+                        (dedup_key, scope),
+                    ).fetchone()
+                    if existing:
+                        raise DuplicateEventError(str(existing["case_id"])) from error
+                existing_by_id = connection.execute(
+                    "SELECT case_id FROM events WHERE event_id = ? AND reset_scope = ?",
+                    (event_id, scope),
                 ).fetchone()
-                if existing:
-                    raise DuplicateEventError(str(existing["case_id"])) from error
+                if existing_by_id:
+                    raise DuplicateEventError(str(existing_by_id["case_id"])) from error
                 raise
             connection.execute("COMMIT")
             if cursor.lastrowid is None:

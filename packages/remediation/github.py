@@ -59,7 +59,10 @@ class GitHubDraftPRAdapter:
                 integration=IntegrationResult(
                     status=IntegrationStatus.FAILED,
                     operation="github_create_draft_pr",
-                    message=f"Draft PR creation failed; local bundle retained: {error}",
+                    message=(
+                        "Draft PR creation failed; local bundle retained "
+                        f"({type(error).__name__})"
+                    ),
                     evidence_refs=[str(bundle)],
                     details={"repository": self.repository, "requires_human_merge": True},
                 ),
@@ -113,8 +116,18 @@ class GitHubDraftPRAdapter:
             raise ValueError("GitHub patch path must be a safe repository-relative path")
         worktree = self.runtime_dir / "worktrees" / _slug(case_id)
         worktree.parent.mkdir(parents=True, exist_ok=True)
-        if worktree.exists():
-            raise ValueError(f"Worktree path already exists: {worktree}")
+        # A prior attempt killed before its finally block can orphan the worktree
+        # directory and the local branch. Prune both so this attempt is
+        # self-healing instead of permanently failing with "already exists".
+        self._cleanup_worktree(worktree, branch)
+        subprocess.run(
+            ["git", "worktree", "prune"],
+            cwd=self.repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
         def run(args: list[str], cwd: Path = self.repo_root) -> str:
             result = subprocess.run(
@@ -193,14 +206,29 @@ class GitHubDraftPRAdapter:
             )
         finally:
             if created:
-                subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(worktree)],
-                    cwd=self.repo_root,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
+                self._cleanup_worktree(worktree, branch)
+
+    def _cleanup_worktree(self, worktree: Path, branch: str) -> None:
+        """Remove the worktree and the local branch it created.
+
+        ``git worktree remove`` deletes the working tree but leaves the branch
+        that ``git worktree add -b`` created. Without deleting that ref, a later
+        attempt for the same case fails with "a branch named ... already exists"
+        and the real-PR path degrades to a bundle forever. Both commands are
+        best-effort so cleanup never masks the original error.
+        """
+        for args in (
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            ["git", "branch", "-D", branch],
+        ):
+            subprocess.run(
+                args,
+                cwd=self.repo_root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
 
 
 def _slug(value: str) -> str:

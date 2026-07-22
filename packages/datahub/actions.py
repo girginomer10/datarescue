@@ -48,6 +48,13 @@ class DataHubSchemaMCLWatcher:
         self.sink = sink
 
     def handle(self, payload: Mapping[str, Any]) -> MCLActionResult:
+        if not isinstance(payload, Mapping):
+            # main()/act() may pass a value that is valid JSON but not an object
+            # (e.g. a bare number or list); fail cleanly instead of AttributeError.
+            return MCLActionResult(
+                status=MCLActionStatus.FAILED,
+                reason="MCL payload is not a JSON object",
+            )
         event_type = payload.get("event_type") or payload.get("eventType")
         if event_type and event_type != "MetadataChangeLogEvent_v1":
             return MCLActionResult(
@@ -87,16 +94,24 @@ class DataHubSchemaMCLWatcher:
                     reason="schemaMetadata event contains no field-level change",
                 )
             response = self.sink(event)
+        except PermissionError:
+            # DataHub streams MCLs for every dataset; a change to an asset outside
+            # the remediation allowlist is out of scope, not an error to retry.
+            return MCLActionResult(
+                status=MCLActionStatus.SKIPPED,
+                reason="Asset is outside the remediation allowlist",
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             return MCLActionResult(
                 status=MCLActionStatus.FAILED,
                 reason=f"Invalid schemaMetadata MCL: {error}",
             )
         case = getattr(response, "case", None)
+        case_id = getattr(case, "id", None)
         return MCLActionResult(
             status=MCLActionStatus.ENQUEUED,
             reason="Schema transition accepted by the idempotent workflow",
-            case_id=str(case.id) if case is not None else None,
+            case_id=str(case_id) if case_id is not None else None,
             deduplicated=getattr(response, "deduplicated", None),
         )
 
@@ -272,17 +287,27 @@ def _mcl_event_id(payload: Mapping[str, Any]) -> str:
     return f"mcl-{hashlib.sha256(stable.encode()).hexdigest()}"
 
 
+def _from_millis(value: Any) -> datetime | None:
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        # An out-of-range epoch (e.g. 10**20 ms) must not crash the watcher.
+        return None
+
+
 def _observed_at(payload: Mapping[str, Any]) -> datetime:
     created = payload.get("created")
     if isinstance(created, Mapping):
-        milliseconds = created.get("time")
-        if isinstance(milliseconds, (int, float)):
-            return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+        parsed = _from_millis(created.get("time"))
+        if parsed is not None:
+            return parsed
     system = payload.get("systemMetadata")
     if isinstance(system, Mapping):
-        milliseconds = system.get("lastObserved")
-        if isinstance(milliseconds, (int, float)):
-            return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+        parsed = _from_millis(system.get("lastObserved"))
+        if parsed is not None:
+            return parsed
     return datetime.now(UTC)
 
 

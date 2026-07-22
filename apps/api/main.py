@@ -111,8 +111,17 @@ def create_app(
         except CaseNotFoundError as error:
             raise HTTPException(status_code=404, detail="Case not found") from error
 
+        # Native EventSource reconnects with a Last-Event-ID header (already CORS
+        # allow-listed) and no query param, so honor it when `after` is unset;
+        # otherwise a dropped follow stream replays every event on reconnect.
+        header_cursor = request.headers.get("last-event-id", "")
+        start = after or (int(header_cursor) if header_cursor.isdigit() else 0)
+        # Bound a single follow connection's lifetime so an abandoned or abusive
+        # stream cannot poll the threadpool forever; clients reconnect and resume.
+        max_follow_ticks = 4800  # ~1 hour at 0.75s per idle tick
+
         async def stream() -> AsyncIterator[str]:
-            cursor = after
+            cursor = start
             idle_ticks = 0
             while True:
                 events = await run_in_threadpool(
@@ -126,6 +135,8 @@ def create_app(
                 if await request.is_disconnected():
                     break
                 idle_ticks += 1
+                if idle_ticks >= max_follow_ticks:
+                    break
                 if idle_ticks % 20 == 0:
                     yield ": keep-alive\n\n"
                 await asyncio.sleep(0.75)
@@ -186,7 +197,7 @@ def create_app(
 
     @app.post("/api/v1/demo/reset", response_model=DemoResetResponse)
     async def demo_reset(request: Request) -> DemoResetResponse:
-        sequence = await run_in_threadpool(service(request).store.reset)
+        sequence = await run_in_threadpool(service(request).reset)
         return DemoResetResponse(
             reset_sequence=sequence,
             message="Demo reset appended; historical evidence was not deleted",

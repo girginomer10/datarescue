@@ -125,6 +125,10 @@ class ReplayEvidenceExecutor:
         )
 
 
+_CONNECT_TIMEOUT_SECONDS = 10
+_STATEMENT_TIMEOUT_MS = 60_000
+
+
 class PostgresDbtExecutor:
     """Execute an allowlisted candidate in its own Postgres schema and run dbt."""
 
@@ -147,11 +151,26 @@ class PostgresDbtExecutor:
         self.source_relation = source_relation
         self.baseline_relation = baseline_relation
 
+    def _connect(self, *, autocommit: bool = False):  # type: ignore[no-untyped-def]
+        """Open a bounded psycopg connection.
+
+        A wedged database must surface a catchable error instead of hanging the
+        single worker thread forever, so every connection carries a connect
+        timeout and a server-side statement timeout.
+        """
+        import psycopg
+
+        return psycopg.connect(
+            self.postgres_dsn,
+            autocommit=autocommit,
+            connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+            options=f"-c statement_timeout={_STATEMENT_TIMEOUT_MS}",
+        )
+
     def execute(
         self, *, case_id: str, proposal: CandidateProposal, context: ContextBundle
     ) -> CandidateExecution:
         try:
-            import psycopg
             from psycopg import sql
         except ImportError as error:  # pragma: no cover - dependency is installed in production
             raise RuntimeError("psycopg is required for live candidate execution") from error
@@ -160,7 +179,7 @@ class PostgresDbtExecutor:
         candidate_query = render_candidate_sql(proposal, relation=self.source_relation)
         candidate_ref = self._write_evidence(schema, "candidate.sql", candidate_query + "\n")
         try:
-            with psycopg.connect(self.postgres_dsn, autocommit=False) as connection:
+            with self._connect(autocommit=False) as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
                         sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
@@ -199,7 +218,6 @@ class PostgresDbtExecutor:
             self._drop_candidate_schema(schema)
 
     def _reconcile(self, schema: str) -> ReconciliationMetrics:
-        import psycopg
         from psycopg import sql
 
         baseline_parts = [
@@ -212,7 +230,7 @@ class PostgresDbtExecutor:
             sql.Identifier(baseline_parts[0]), sql.Identifier(baseline_parts[1])
         )
         candidate = sql.SQL("{}.payments_fct").format(sql.Identifier(schema))
-        with psycopg.connect(self.postgres_dsn) as connection, connection.cursor() as cursor:
+        with self._connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 sql.SQL(
                     "SELECT COUNT(*), COALESCE(SUM(revenue), 0), "
@@ -283,6 +301,11 @@ class PostgresDbtExecutor:
             "--target",
             self.dbt_target,
         ]
+        results_path = self.dbt_project_dir / "target" / "run_results.json"
+        # dbt only rewrites run_results.json once it begins executing nodes; a
+        # compile/parse failure leaves the previous candidate's file in place.
+        # Remove it first so a failed build can never report stale passing counts.
+        results_path.unlink(missing_ok=True)
         try:
             completed = subprocess.run(
                 command,
@@ -298,7 +321,6 @@ class PostgresDbtExecutor:
                 command=" ".join(command),
                 summary=f"dbt did not complete: {error}",
             )
-        results_path = self.dbt_project_dir / "target" / "run_results.json"
         passed_checks = 0
         total_checks = 0
         passed_nodes = 0
@@ -353,11 +375,10 @@ class PostgresDbtExecutor:
         return str(destination)
 
     def _drop_candidate_schema(self, schema: str) -> None:
-        import psycopg
         from psycopg import sql
 
         with (
-            psycopg.connect(self.postgres_dsn, autocommit=True) as connection,
+            self._connect(autocommit=True) as connection,
             connection.cursor() as cursor,
         ):
             cursor.execute(

@@ -106,43 +106,63 @@ class WorkflowService:
                 f"Asset is outside the configured remediation allowlist: {event.entity_urn}"
             )
         dedup_key = schema_event_dedup_key(event)
-        existing = self.store.find_case_for_dedup(dedup_key)
-        if existing:
-            return SchemaChangeResponse(case=self.store.get_case(existing), deduplicated=True)
-        case_id = case_id_from_dedup(dedup_key)
-        local_incident_urn = f"urn:li:dataRescueIncident:{case_id}"
-        try:
-            self.store.append(
-                case_id=case_id,
-                event_type=EventType.SCHEMA_CHANGE_DETECTED,
-                state=CaseState.DETECTED,
-                dedup_key=dedup_key,
-                event_id=event.event_id,
-                payload={
-                    "schema_change": event.model_dump(mode="json"),
-                    "incident_urn": local_incident_urn,
-                },
-            )
-        except DuplicateEventError as duplicate:
-            return SchemaChangeResponse(
-                case=self.store.get_case(duplicate.case_id), deduplicated=True
-            )
-        try:
-            with self._worker_lock:
-                self._advance(case_id=case_id, event=event)
-        except Exception as error:  # keep a durable failure without leaking configuration
-            current = self.store.get_case(case_id)
-            if current.state not in {CaseState.RESOLVED, CaseState.CONTAINED, CaseState.FAILED}:
+        # v1 serializes the entire case-creation flow. The initial detection
+        # event and every _advance append must be atomic with respect to a demo
+        # reset; otherwise a reset appended between them would split a single
+        # case across dedup scopes and permanently break its projection.
+        with self._worker_lock:
+            existing = self.store.find_case_for_dedup(dedup_key)
+            if existing:
+                return SchemaChangeResponse(
+                    case=self.store.get_case(existing), deduplicated=True
+                )
+            case_id = case_id_from_dedup(dedup_key)
+            local_incident_urn = f"urn:li:dataRescueIncident:{case_id}"
+            try:
                 self.store.append(
                     case_id=case_id,
-                    event_type=EventType.FAILED,
-                    state=CaseState.FAILED,
+                    event_type=EventType.SCHEMA_CHANGE_DETECTED,
+                    state=CaseState.DETECTED,
+                    dedup_key=dedup_key,
+                    event_id=event.event_id,
                     payload={
-                        "error_type": type(error).__name__,
-                        "message": "Workflow execution failed; inspect server logs for details",
+                        "schema_change": event.model_dump(mode="json"),
+                        "incident_urn": local_incident_urn,
                     },
                 )
-        return SchemaChangeResponse(case=self.store.get_case(case_id), deduplicated=False)
+            except DuplicateEventError as duplicate:
+                return SchemaChangeResponse(
+                    case=self.store.get_case(duplicate.case_id), deduplicated=True
+                )
+            try:
+                self._advance(case_id=case_id, event=event)
+            except Exception as error:  # durable failure without leaking configuration
+                current = self.store.get_case(case_id)
+                if current.state not in {
+                    CaseState.RESOLVED,
+                    CaseState.CONTAINED,
+                    CaseState.FAILED,
+                }:
+                    self.store.append(
+                        case_id=case_id,
+                        event_type=EventType.FAILED,
+                        state=CaseState.FAILED,
+                        payload={
+                            "error_type": type(error).__name__,
+                            "message": (
+                                "Workflow execution failed; inspect server logs for details"
+                            ),
+                        },
+                    )
+            return SchemaChangeResponse(
+                case=self.store.get_case(case_id), deduplicated=False
+            )
+
+    def reset(self, reason: str = "Demo reset requested") -> int:
+        # Serialize the reset against the case-creation flow so a reset can never
+        # interleave within a single ingest and split its event stream.
+        with self._worker_lock:
+            return self.store.reset(reason)
 
     def _advance(self, *, case_id: str, event: SchemaChangeEvent) -> None:
         incident_result = self.incidents.raise_incident(
@@ -311,6 +331,16 @@ class WorkflowService:
             )
 
     def verify_deployment(
+        self, case_id: str, request: VerifyDeploymentRequest
+    ) -> CaseSnapshot:
+        # Post-deploy verification recomputes evidence against Postgres/dbt/git in
+        # postgres mode, so it must hold the same single-writer lock as ingest and
+        # re-check the case state inside it. This blocks concurrent duplicate
+        # verifications from double-recording a deployment or double-resolving.
+        with self._worker_lock:
+            return self._verify_deployment_locked(case_id, request)
+
+    def _verify_deployment_locked(
         self, case_id: str, request: VerifyDeploymentRequest
     ) -> CaseSnapshot:
         case = self.store.get_case(case_id)

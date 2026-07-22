@@ -9,6 +9,7 @@ workflow, so no Docker or network is required.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -87,6 +88,19 @@ def test_mcl_route_enqueues_real_drift_and_creates_a_case(tmp_path: Path) -> Non
         assert case.json()["state"] == "PATCH_READY"
 
 
+def test_mcl_route_skips_out_of_scope_asset_without_500(tmp_path: Path) -> None:
+    payload = _valid_drift_mcl()
+    payload["entityUrn"] = (
+        "urn:li:dataset:(urn:li:dataPlatform:postgres,other.raw.secrets,PROD)"
+    )
+    with TestClient(create_app(make_test_settings(tmp_path))) as client:
+        response = client.post("/api/v1/events/datahub-mcl", json=payload)
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "SKIPPED"
+    assert "allowlist" in body["reason"].lower()
+
+
 def test_verify_deployment_requires_a_case_in_pr_open(tmp_path: Path) -> None:
     with TestClient(create_app(make_test_settings(tmp_path))) as client:
         # GitHub writes are disabled, so the safe-repair case stops at PATCH_READY.
@@ -125,6 +139,30 @@ def test_verify_deployment_unknown_case_is_404(tmp_path: Path) -> None:
             },
         )
     assert response.status_code == 404
+
+
+def test_sse_stream_resumes_from_last_event_id_header(tmp_path: Path) -> None:
+    with TestClient(create_app(make_test_settings(tmp_path))) as client:
+        case_id = client.post("/api/v1/demo/drift", json={}).json()["case"]["id"]
+        full = client.get(f"/api/v1/cases/{case_id}/events")
+        assert "event: SCHEMA_CHANGE_DETECTED" in full.text
+        sequences = [int(value) for value in re.findall(r"^id: (\d+)$", full.text, re.M)]
+        assert sequences
+
+        # A reconnect past the newest event replays nothing.
+        resumed = client.get(
+            f"/api/v1/cases/{case_id}/events",
+            headers={"Last-Event-ID": str(max(sequences))},
+        )
+        assert "event:" not in resumed.text
+
+        # A mid-stream reconnect replays only events after the given id.
+        partial = client.get(
+            f"/api/v1/cases/{case_id}/events",
+            headers={"Last-Event-ID": str(min(sequences))},
+        )
+        assert "event: SCHEMA_CHANGE_DETECTED" not in partial.text
+        assert "event:" in partial.text
 
 
 def test_unknown_case_lookup_is_404(tmp_path: Path) -> None:
