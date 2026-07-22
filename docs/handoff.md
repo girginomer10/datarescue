@@ -103,3 +103,11 @@
 - Verified: Full `make check` passed with 173 Python tests, 19 web tests, Ruff, mypy across 22 source files, two production builds, and the live PostgreSQL/dbt proof (`gross_amount` rejected at `+3.40%`, `net_amount` selected at `0.00%`, `8/8` checks, candidate schemas cleaned). Replay hashes and repo-memory doctor also passed. Fresh-clone bootstrap and GitHub-hosted CI/Pages remain the release gates.
 - Memory: Extended `memory/bugfixes/audit-hardening-identity-provenance-and-retries.md` with exact origin/PR-head, detached-worktree, fresh-context, cleanup, and stale-provenance invariants.
 - Next: Commit the intended tree, prove it from a `--no-local` fresh clone, fast-forward `main`, push, and wait for CI/Pages. Do not merge draft PR #1. The connected DataHub/OpenAI/human-merge roadmap remains separate.
+
+## 2026-07-22 23:18 +03 - Codex (audit release complete)
+
+- Task: Published the fully audited local result to `origin/main` and closed every release gate for code commit `bac80c6c3b1691aa3bd86dcbd55b98cc426bfc54`.
+- Changed: Fast-forwarded `main` without rewriting history. No recovery PR was merged; draft PR #1 remains open and draft on `datarescue/dr-996c48f0`.
+- Verified: A `--no-local` clean clone installed Python 3.11, dbt Core 1.9.8, and dbt-postgres 1.9.0, then passed full `make check` (173 Python, 19 web, live PostgreSQL/dbt proof). GitHub CI run `29954473684` and Pages run `29954473422` completed successfully, and the hosted replay returned the DataRescue page over HTTPS.
+- Memory: No new note; the existing audit-hardening and definition-of-done notes remain authoritative.
+- Next: Resume at the real DataHub Core/Kafka/MCL-to-incident vertical slice, then prove live MCP/GraphQL/OpenAI, connected containment, explicit human merge plus exact-SHA closure, genuine replay regeneration, video, and Devpost. Do not claim the recorded replay is that connected proof.
