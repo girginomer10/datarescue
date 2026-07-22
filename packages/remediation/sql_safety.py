@@ -61,8 +61,13 @@ def validate_candidate_sql(sql: str, *, relation: str = "payments_raw") -> str:
         rf"\s+FROM\s+{re.escape(relation)}\s*\Z",
         re.IGNORECASE,
     )
-    if not pattern.fullmatch(sql):
+    match = pattern.fullmatch(sql)
+    if not match:
         raise SQLSafetyError("Candidate SQL does not match the read-only allowlisted shape")
+    # Re-validate the captured identifiers so this independent gate is exactly as
+    # strict as render_candidate_sql: the alias must be the pinned 'revenue'.
+    require_identifier(match.group(1), "source field")
+    require_revenue_alias(match.group(2))
     return sql
 
 
