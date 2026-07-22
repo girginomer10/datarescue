@@ -14,7 +14,11 @@ import type {
 } from "../types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL ?? "").replace(/\/$/, "");
-const API_TIMEOUT = Number(import.meta.env.VITE_API_TIMEOUT_MS ?? 3500);
+const PARSED_API_TIMEOUT = Number(import.meta.env.VITE_API_TIMEOUT_MS);
+// A non-numeric override (e.g. "3500ms") would become NaN, and setTimeout(NaN)
+// aborts on the first tick — silently forcing permanent replay fallback.
+const API_TIMEOUT =
+  Number.isFinite(PARSED_API_TIMEOUT) && PARSED_API_TIMEOUT > 0 ? PARSED_API_TIMEOUT : 3500;
 const FORCE_REPLAY = import.meta.env.VITE_FORCE_REPLAY === "true";
 const HOSTED_REPLAY_REASON =
   "manifest.json records SHA-256 digests for every included artifact";
@@ -642,6 +646,14 @@ function normalizeCase(raw: unknown, requestedId: string): RescueCase {
         ]
       : [];
   const backendLineageData = backendLineage(item, summary.assetUrn);
+  // Nodes and edges must come from the same source. Mixing API-provided nodes
+  // with synthesized edges (or vice versa) yields edges whose endpoints do not
+  // exist among the nodes, and ReactFlow silently drops every such edge.
+  const providedLineageNodes = arrayValue(pick(item, "lineageNodes", "lineage_nodes") ?? lineage.nodes);
+  const providedLineageEdges = arrayValue(pick(item, "lineageEdges", "lineage_edges") ?? lineage.edges);
+  const useProvidedLineage = providedLineageNodes.length > 0;
+  const rawLineageNodes = useProvidedLineage ? providedLineageNodes : backendLineageData.nodes;
+  const rawLineageEdges = useProvidedLineage ? providedLineageEdges : backendLineageData.edges;
   const pullRequest = asRecord(item.pull_request);
   const pullRequestIntegration = asRecord(pullRequest.integration);
   const outcomeTone = state === "RESOLVED" ? "success" : state === "CONTAINED" || state === "FAILED" ? "danger" : "warning";
@@ -673,11 +685,7 @@ function normalizeCase(raw: unknown, requestedId: string): RescueCase {
       ? normalizeIntegrations(item.integrations)
       : backendIntegrations(item),
     stages: normalizeStages(item.stages, state),
-    lineageNodes: (
-      arrayValue(pick(item, "lineageNodes", "lineage_nodes") ?? lineage.nodes).length
-        ? arrayValue(pick(item, "lineageNodes", "lineage_nodes") ?? lineage.nodes)
-        : backendLineageData.nodes
-    ).map((rawNode, index) => {
+    lineageNodes: rawLineageNodes.map((rawNode, index) => {
       const node = asRecord(rawNode);
       const status = stringValue(node.status, "healthy");
       return {
@@ -688,11 +696,7 @@ function normalizeCase(raw: unknown, requestedId: string): RescueCase {
         owner: stringValue(node.owner, "Unassigned"),
       };
     }),
-    lineageEdges: (
-      arrayValue(pick(item, "lineageEdges", "lineage_edges") ?? lineage.edges).length
-        ? arrayValue(pick(item, "lineageEdges", "lineage_edges") ?? lineage.edges)
-        : backendLineageData.edges
-    ).map((rawEdge) => {
+    lineageEdges: rawLineageEdges.map((rawEdge) => {
       const edge = asRecord(rawEdge);
       return {
         source: stringValue(edge.source),

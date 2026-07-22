@@ -50,7 +50,9 @@ export function CasePage() {
       </main>
     );
   }
-  if (!caseId || query.isError || !query.data) {
+  // Once a case has loaded, keep rendering it even if a later poll fails (e.g. a
+  // transient 404 after a reset); only fall to the error panel on initial load.
+  if (!caseId || !query.data) {
     const message =
       query.error instanceof Error
         ? query.error.message

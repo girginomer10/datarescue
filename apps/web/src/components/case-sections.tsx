@@ -146,6 +146,7 @@ export function CandidateMatrix({ candidates }: { candidates: Candidate[] }) {
       <SectionHeading
         eyebrow="DETERMINISTIC DECISION"
         title="Candidate decision matrix"
+        titleId="candidate-matrix-title"
         detail="A successful build is necessary, not sufficient. Every evidence gate must pass."
         action={<StatusBadge label="0.50% variance ceiling" tone="neutral" />}
       />
@@ -271,12 +272,14 @@ export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges
       <SectionHeading
         eyebrow="DATAHUB CONTEXT"
         title="Affected lineage"
+        titleId="lineage-title"
         detail="Runtime blast radius captured at detection time."
         action={
           <div className="segmented-control" role="tablist" aria-label="Lineage view">
             <button
               aria-controls="lineage-graph-panel"
               aria-selected={view === "graph"}
+              id="lineage-graph-tab"
               onClick={() => setView("graph")}
               role="tab"
               type="button"
@@ -286,6 +289,7 @@ export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges
             <button
               aria-controls="lineage-table-panel"
               aria-selected={view === "table"}
+              id="lineage-table-tab"
               onClick={() => setView("table")}
               role="tab"
               type="button"
@@ -295,9 +299,17 @@ export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges
           </div>
         }
       />
-      {view === "graph" ? (
-        <div id="lineage-graph-panel" role="tabpanel" aria-label="Lineage graph" className="lineage-canvas">
-          {nodes.length ? (
+      {/* Both tabpanels stay mounted so each tab's aria-controls always resolves;
+          the heavy ReactFlow graph is only instantiated while its tab is active. */}
+      <div
+        id="lineage-graph-panel"
+        role="tabpanel"
+        aria-labelledby="lineage-graph-tab"
+        className="lineage-canvas"
+        hidden={view !== "graph"}
+      >
+        {view === "graph" ? (
+          nodes.length ? (
             <ReactFlow
               nodes={flowNodes}
               edges={flowEdges}
@@ -314,11 +326,17 @@ export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges
             </ReactFlow>
           ) : (
             <div className="empty-section">No lineage graph was returned by the API.</div>
-          )}
-        </div>
-      ) : (
-        <div id="lineage-table-panel" role="tabpanel" className="table-scroll lineage-table-wrap">
-          <table className="lineage-table">
+          )
+        ) : null}
+      </div>
+      <div
+        id="lineage-table-panel"
+        role="tabpanel"
+        aria-labelledby="lineage-table-tab"
+        className="table-scroll lineage-table-wrap"
+        hidden={view !== "table"}
+      >
+        <table className="lineage-table">
             <caption className="sr-only">Accessible table equivalent of the affected lineage graph</caption>
             <thead>
               <tr>
@@ -341,8 +359,7 @@ export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges
               ))}
             </tbody>
           </table>
-        </div>
-      )}
+      </div>
     </section>
   );
 }
@@ -357,6 +374,7 @@ export function EvidencePanel({ evidence, recorded = false }: { evidence: Eviden
       <SectionHeading
         eyebrow={recorded ? "RECORDED CONTEXT" : "RETRIEVED, NOT ASSUMED"}
         title={recorded ? "Recorded context evidence" : "DataHub evidence"}
+        titleId="evidence-title"
         detail={
           recorded
             ? "Replay claims retain their captured source and freshness metadata."
@@ -403,6 +421,7 @@ export function SqlDiff({ lines }: { lines: DiffLine[] }) {
       <SectionHeading
         eyebrow="SELECTED PATCH"
         title="dbt SQL diff"
+        titleId="diff-title"
         detail="Rendered by the allowlisted patch generator."
         action={
           <button className="icon-text-button" onClick={copyDiff} type="button" disabled={!lines.length}>
@@ -438,6 +457,7 @@ export function ValidationLedger({ entries }: { entries: ValidationEntry[] }) {
       <SectionHeading
         eyebrow="APPEND-ONLY PROOF"
         title="Validation ledger"
+        titleId="ledger-title"
         detail="Measured against audit.payments_fct_last_good."
       />
       {entries.length ? (
@@ -486,6 +506,7 @@ export function RecoveryTimeline({ entries }: { entries: TimelineEntry[] }) {
       <SectionHeading
         eyebrow="WRITE-BACK & REVIEW"
         title="Recovery timeline"
+        titleId="timeline-title"
         detail="PR creation is not recovery. The incident remains active until post-deploy proof."
       />
       {entries.length ? (
@@ -519,6 +540,7 @@ export function ContainmentPanel({ proof, active }: { proof: ContainmentProof; a
       <SectionHeading
         eyebrow={active ? "FAIL-CLOSED RESULT" : "FAIL-CLOSED ALTERNATIVE"}
         title={proof.title}
+        titleId="containment-title"
         detail={proof.detail}
         action={active ? <StatusBadge label="Guard engaged" tone="danger" /> : <StatusBadge label="Policy enforced" tone="neutral" />}
       />

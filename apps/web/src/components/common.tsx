@@ -83,11 +83,13 @@ export function DataSourceBanner<T>({ envelope }: { envelope: ApiEnvelope<T> }) 
 export function SectionHeading({
   eyebrow,
   title,
+  titleId,
   detail,
   action,
 }: {
   eyebrow?: string;
   title: string;
+  titleId?: string;
   detail?: string;
   action?: React.ReactNode;
 }) {
@@ -95,7 +97,7 @@ export function SectionHeading({
     <div className="section-heading">
       <div>
         {eyebrow ? <p className="eyebrow">{eyebrow}</p> : null}
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         {detail ? <p>{detail}</p> : null}
       </div>
       {action ? <div className="section-heading__action">{action}</div> : null}

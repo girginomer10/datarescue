@@ -25,6 +25,15 @@ describe("Forensic Console evidence behavior", () => {
     expect(within(netRow).getByText("SELECTED")).toBeInTheDocument();
   });
 
+  it("gives a labeled section region an accessible name from its heading", () => {
+    render(<CandidateMatrix candidates={validatedReplayCase.candidates} />);
+    // The section uses aria-labelledby; the heading must render the matching id
+    // or the region has no accessible name for assistive technology.
+    expect(
+      screen.getByRole("region", { name: /Candidate decision matrix/i }),
+    ).toBeInTheDocument();
+  });
+
   it("keeps the fail-closed replay aligned with the canonical settlement fixture", () => {
     render(<CandidateMatrix candidates={containedReplayCase.candidates} />);
     const row = screen.getByRole("row", { name: /settlement_amount AS revenue/i });

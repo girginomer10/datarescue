@@ -164,7 +164,7 @@ export function QueuePage() {
                     <StatusBadge label={item.stateLabel} tone={toneForState(item.state)} />
                     {item.selectedCandidate ? <small className="selected-mapping">{item.selectedCandidate}</small> : null}
                   </td>
-                  <td><span className={`incident-state incident-state--${item.incidentStatus.toLowerCase()}`}>{item.incidentStatus}</span></td>
+                  <td><span className={`incident-state incident-state--${item.incidentStatus.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}>{item.incidentStatus}</span></td>
                   <td><time dateTime={item.updatedAt}>{formatDateTime(item.updatedAt)}</time></td>
                   <td>
                     <Link aria-label={`Open ${item.id}`} className="row-action" to={`/cases/${item.id}`}>
