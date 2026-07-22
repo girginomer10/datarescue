@@ -45,6 +45,12 @@ from tests.backend_helpers import REPO_ROOT, make_test_settings
 STG_MODEL = REPO_ROOT / "demo/dbt/models/staging/stg_payments.sql"
 
 
+class _LiveReplayExecutor(ReplayEvidenceExecutor):
+    """Deterministic test double that explicitly represents fresh live evidence."""
+
+    produces_live_evidence = True
+
+
 class _SuccessfulDraftPR:
     def create_draft(self, *, case_id: str, patch: object) -> PullRequestArtifact:
         url = f"https://github.test/datarescue/pull/{case_id}"
@@ -219,7 +225,7 @@ class _RaisingExecutor:
         raise RuntimeError("postgres unavailable")
 
 
-def test_case_id_prefix_collision_is_handled_as_a_duplicate(
+def test_case_id_prefix_collision_allocates_a_distinct_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import apps.api.workflow as workflow_module
@@ -231,13 +237,14 @@ def test_case_id_prefix_collision_is_handled_as_a_duplicate(
     with TestClient(create_app(settings, workflow)) as client:
         first = client.post("/api/v1/demo/drift", json={}).json()
         assert first["case"]["state"] == "PATCH_READY"  # advanced past DETECTED
-        # A different drift (different dedup key) that maps to the same case id
-        # must not escape as a 500.
+        # A different drift (different dedup key) that maps to the same short
+        # case id must receive a widened id rather than being conflated.
         response = client.post("/api/v1/demo/drift", json={"scenario": "fail-closed"})
     assert response.status_code == 200
     body = response.json()
-    assert body["deduplicated"] is True
-    assert body["case"]["id"] == "DR-COLLIDE"
+    assert body["deduplicated"] is False
+    assert body["case"]["id"].startswith("DR-")
+    assert body["case"]["id"] != first["case"]["id"]
 
 
 def test_executor_failure_fails_closed_to_rejected(tmp_path: Path) -> None:
@@ -457,7 +464,14 @@ def _patched_model() -> str:
 
 def _fake_git_show(model: str):  # type: ignore[no-untyped-def]
     def fake_git(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        stdout = model if command[1] == "show" else ""
+        if command[1] == "show":
+            stdout = model
+        elif command[1:4] == ["remote", "get-url", "origin"]:
+            stdout = "git@github.com:girginomer10/datarescue.git\n"
+        elif command[1] == "rev-parse":
+            stdout = "a" * 40 + "\n"
+        else:
+            stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
     return fake_git
@@ -512,7 +526,7 @@ def test_post_deploy_writeback_failure_keeps_incident_active(
         incidents=_SuccessfulIncidents(),  # type: ignore[arg-type]
         mcp=_WritebackFailsOnRecovered(),  # type: ignore[arg-type]
         github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
-        executor=ReplayEvidenceExecutor(),  # type: ignore[arg-type]
+        executor=_LiveReplayExecutor(),
     )
     monkeypatch.setattr(subprocess, "run", _fake_git_show(_patched_model()))
     with TestClient(create_app(settings, workflow)) as client:
@@ -535,7 +549,7 @@ def test_post_deploy_resolution_failure_keeps_incident_active(
         incidents=_ResolveFailsIncidents(),  # type: ignore[arg-type]
         mcp=_ValidContextMCP(),  # type: ignore[arg-type]
         github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
-        executor=ReplayEvidenceExecutor(),  # type: ignore[arg-type]
+        executor=_LiveReplayExecutor(),
     )
     monkeypatch.setattr(subprocess, "run", _fake_git_show(_patched_model()))
     with TestClient(create_app(settings, workflow)) as client:
@@ -582,7 +596,7 @@ def test_live_post_deploy_rejects_a_merge_without_the_validated_mapping(
     workflow = WorkflowService(
         settings,
         github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
-        executor=ReplayEvidenceExecutor(),  # type: ignore[arg-type]
+        executor=_LiveReplayExecutor(),
     )
     # The merged model as returned by `git show` still has the pre-drift default,
     # i.e. it does NOT contain the validated net_amount mapping.
@@ -591,7 +605,14 @@ def test_live_post_deploy_rejects_a_merge_without_the_validated_mapping(
     )
 
     def fake_git(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        stdout = unpatched if command[1] == "show" else ""
+        if command[1] == "show":
+            stdout = unpatched
+        elif command[1:4] == ["remote", "get-url", "origin"]:
+            stdout = "git@github.com:girginomer10/datarescue.git\n"
+        elif command[1] == "rev-parse":
+            stdout = "a" * 40 + "\n"
+        else:
+            stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_git)

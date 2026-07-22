@@ -75,23 +75,47 @@ function ArtifactReference({ reference, className }: { reference: string; classN
   );
 }
 
-export function IntegrationStrip({ integrations }: { integrations: IntegrationStatus[] }) {
+export function IntegrationStrip({
+  integrations,
+  captured = false,
+}: {
+  integrations: IntegrationStatus[];
+  captured?: boolean;
+}) {
   if (!integrations.length) {
-    return <p className="empty-note">Integration health was not returned by the live API.</p>;
+    return (
+      <p className="empty-note">
+        {captured
+          ? "Integration health was not present in the captured API snapshot."
+          : "Integration health was not returned by the live API."}
+      </p>
+    );
   }
   return (
-    <ul className="case-integrations" aria-label="Case integration status">
+    <ul
+      className="case-integrations"
+      aria-label={captured ? "Captured case integration status" : "Case integration status"}
+    >
       {integrations.map((integration) => {
         const Icon = integrationIcons[integration.id];
         return (
-          <li className={`case-integration case-integration--${integration.state}`} key={integration.id}>
+          <li
+            className={`case-integration case-integration--${captured ? "pending" : integration.state}`}
+            key={integration.id}
+          >
             <Icon aria-hidden="true" size={17} strokeWidth={1.8} />
             <span>
               <strong>{integration.label}</strong>
-              <small>{integration.detail}</small>
+              <small>
+                {captured
+                  ? "Last reported integration state; refresh required."
+                  : integration.detail}
+              </small>
             </span>
             <span className="case-integration__state">
-              {integration.state === "ready"
+              {captured
+                ? "CAPTURED"
+                : integration.state === "ready"
                 ? "READY"
                 : integration.state === "pending"
                   ? "PENDING"
@@ -226,7 +250,15 @@ export function CandidateMatrix({ candidates }: { candidates: Candidate[] }) {
   );
 }
 
-export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges: LineageEdgeData[] }) {
+export function LineagePanel({
+  nodes,
+  edges,
+  captured = false,
+}: {
+  nodes: LineageNodeData[];
+  edges: LineageEdgeData[];
+  captured?: boolean;
+}) {
   const [view, setView] = useState<"graph" | "table">("graph");
   const flowNodes = useMemo<Node[]>(
     () =>
@@ -270,10 +302,14 @@ export function LineagePanel({ nodes, edges }: { nodes: LineageNodeData[]; edges
   return (
     <section className="panel lineage-panel" aria-labelledby="lineage-title">
       <SectionHeading
-        eyebrow="DATAHUB CONTEXT"
-        title="Affected lineage"
+        eyebrow={captured ? "CAPTURED DATAHUB CONTEXT" : "DATAHUB CONTEXT"}
+        title={captured ? "Captured affected lineage" : "Affected lineage"}
         titleId="lineage-title"
-        detail="Runtime blast radius captured at detection time."
+        detail={
+          captured
+            ? "Last successful lineage snapshot; the current blast radius is unverified."
+            : "Runtime blast radius captured at detection time."
+        }
         action={
           <div className="segmented-control" role="tablist" aria-label="Lineage view">
             <button
@@ -368,15 +404,35 @@ function verdictTone(verdict: EvidenceItem["verdict"]): "success" | "danger" | "
   return verdict === "pass" ? "success" : verdict === "fail" ? "danger" : "warning";
 }
 
-export function EvidencePanel({ evidence, recorded = false }: { evidence: EvidenceItem[]; recorded?: boolean }) {
+export type EvidenceProvenance = "live" | "recorded" | "stale";
+
+export function EvidencePanel({
+  evidence,
+  provenance = "live",
+}: {
+  evidence: EvidenceItem[];
+  provenance?: EvidenceProvenance;
+}) {
+  const recorded = provenance === "recorded";
+  const stale = provenance === "stale";
   return (
     <section className="panel evidence-panel" aria-labelledby="evidence-title">
       <SectionHeading
-        eyebrow={recorded ? "RECORDED CONTEXT" : "RETRIEVED, NOT ASSUMED"}
-        title={recorded ? "Recorded context evidence" : "DataHub evidence"}
+        eyebrow={
+          stale ? "CAPTURED API SNAPSHOT" : recorded ? "RECORDED CONTEXT" : "RETRIEVED, NOT ASSUMED"
+        }
+        title={
+          stale
+            ? "Captured context evidence"
+            : recorded
+              ? "Recorded context evidence"
+              : "DataHub evidence"
+        }
         titleId="evidence-title"
         detail={
-          recorded
+          stale
+            ? "Claims are retained from the last successful response; their current validity is unverified."
+            : recorded
             ? "Replay claims retain their captured source and freshness metadata."
             : "Every semantic claim keeps its source and freshness."
         }
@@ -388,13 +444,21 @@ export function EvidencePanel({ evidence, recorded = false }: { evidence: Eviden
               <div className="evidence-card__topline">
                 <span>{item.sourceType}</span>
                 <StatusBadge
-                  label={item.verdict === "pass" ? (recorded ? "Recorded" : "Current") : item.verdict}
-                  tone={verdictTone(item.verdict)}
+                  label={
+                    stale
+                      ? `Captured ${item.verdict}`
+                      : item.verdict === "pass"
+                        ? recorded
+                          ? "Recorded"
+                          : "Current"
+                        : item.verdict
+                  }
+                  tone={stale ? "warning" : verdictTone(item.verdict)}
                 />
               </div>
               <p>{item.claim}</p>
               <code title={item.source}>{item.source}</code>
-              <small>{item.freshness}</small>
+              <small>{stale ? `Captured snapshot · ${item.freshness}` : item.freshness}</small>
             </article>
           ))}
         </div>

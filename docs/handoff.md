@@ -87,3 +87,19 @@
 - Memory: added `memory/bugfixes/workflow-writer-serialization.md`.
 - Next: the connected vertical slice (real DataHub Core/Kafka/MCP/GraphQL +
   live OpenAI + human merge) remains the outstanding completion gate.
+
+## 2026-07-22 22:05 +03 - Codex (audit follow-up hardening)
+
+- Task: Reproduced the remaining review findings, repaired the confirmed safety and honesty gaps, and prepared the result for `main`.
+- Changed: Added explicit live-evidence provenance and PostgreSQL DSN fail-fast; conflict-safe event IDs and collision-safe readable case IDs; bounded SSE cursors; machine-labelled MCL allowlist handling; safe/idempotent GitHub PR retry ownership checks; honest stale/reset UI states; complete policy accessibility labels; a pinned Python 3.11 bootstrap/runtime; and collision-proof PostgreSQL candidate-schema names.
+- Verified: 155 Python tests, 19 web tests, frontend production build, Ruff, mypy, diff checks, and the live PostgreSQL/dbt vertical slice (`gross_amount` rejected at `+3.40%`, `net_amount` selected at `0.00%`, `8/8` checks, distinct evidence artifacts, candidate schemas cleaned). Fresh-clone bootstrap and GitHub-hosted checks are the final release gates for this commit.
+- Memory: Added `memory/bugfixes/audit-hardening-identity-provenance-and-retries.md` with the durable identity, provenance, identifier-length, toolchain, and GitHub retry invariants.
+- Next: Push the verified commit to `origin/main` and wait for CI/Pages. The real DataHub Core/Kafka/MCP/GraphQL plus live OpenAI and human-merge closure remain separate connected-environment completion gates; do not describe the hosted replay as that proof.
+
+## 2026-07-22 23:10 +03 - Codex (final audit closure)
+
+- Task: Closed the independent final audit findings and prepared the hardened local result for a fast-forward release to `main`.
+- Changed: Revalidated every newly created or reused PR against the exact allowed-origin branch head, same repository, non-cross-repository status, and draft state; made interrupted `git worktree add` recovery ownership-safe; made verification temporary-directory cleanup non-fatal; and added regression coverage for each race. Preserved the earlier event identity, exact merge-SHA, live evidence, MCL redelivery, PostgreSQL identifier, and stale-UI fixes.
+- Verified: Full `make check` passed with 173 Python tests, 19 web tests, Ruff, mypy across 22 source files, two production builds, and the live PostgreSQL/dbt proof (`gross_amount` rejected at `+3.40%`, `net_amount` selected at `0.00%`, `8/8` checks, candidate schemas cleaned). Replay hashes and repo-memory doctor also passed. Fresh-clone bootstrap and GitHub-hosted CI/Pages remain the release gates.
+- Memory: Extended `memory/bugfixes/audit-hardening-identity-provenance-and-retries.md` with exact origin/PR-head, detached-worktree, fresh-context, cleanup, and stale-provenance invariants.
+- Next: Commit the intended tree, prove it from a `--no-local` fresh clone, fast-forward `main`, push, and wait for CI/Pages. Do not merge draft PR #1. The connected DataHub/OpenAI/human-merge roadmap remains separate.

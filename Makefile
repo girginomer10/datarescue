@@ -5,10 +5,12 @@ UV ?= uv
 UVX ?= uvx
 NPM ?= npm
 CURL ?= curl
+PYTHON_VERSION ?= 3.11
+UV_RUN := $(UV) run --python $(PYTHON_VERSION)
 DEMO_RUNTIME := bash scripts/demo-runtime.sh
 DATAHUB_VERSION ?= 1.6.0
 DATAHUB_RELEASE ?= v$(DATAHUB_VERSION)
-DATAHUB_CLI := $(UVX) --python 3.11 --from acryl-datahub==$(DATAHUB_VERSION) datahub
+DATAHUB_CLI := $(UVX) --python $(PYTHON_VERSION) --from acryl-datahub==$(DATAHUB_VERSION) datahub
 DATAHUB_ACTIONS_VERSION ?= 1.6.0.15
 DATAHUB_ACTIONS_RECIPE ?= demo/datahub/schema-drift-actions.yml
 DATAHUB_KAFKA_BOOTSTRAP ?= 127.0.0.1:9092
@@ -26,12 +28,12 @@ export POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD POSTGRES_HOST POSTGRES_PORT
 DBT_PROJECT_DIR := demo/dbt
 DBT_CORE_VERSION ?= 1.9.8
 DBT_POSTGRES_VERSION ?= 1.9.0
-DBT := $(UV) run --python 3.11 --with dbt-core==$(DBT_CORE_VERSION) \
+DBT := $(UV_RUN) --with dbt-core==$(DBT_CORE_VERSION) \
 	--with dbt-postgres==$(DBT_POSTGRES_VERSION) -- dbt
 DBT_FLAGS := --project-dir $(DBT_PROJECT_DIR) --profiles-dir $(DBT_PROJECT_DIR)
 PSQL := $(DEMO_RUNTIME) psql
 
-API_CMD ?= $(UV) run uvicorn apps.api.main:app --reload --host 0.0.0.0 --port 8000
+API_CMD ?= $(UV_RUN) uvicorn apps.api.main:app --reload --host 0.0.0.0 --port 8000
 WEB_CMD ?= $(NPM) --prefix apps/web run dev -- --host 0.0.0.0 --port 5173
 DATAHUB_GMS_URL ?= http://127.0.0.1:8080
 DEMO_POSTGRES_DSN := postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)
@@ -53,7 +55,7 @@ bootstrap: api-install web-install ## Install API and web dependencies.
 install: bootstrap ## Judge-friendly alias for installing all dependencies.
 
 api-install:
-	$(UV) sync --all-extras
+	$(UV) sync --python $(PYTHON_VERSION) --all-extras --locked
 
 web-install:
 	@if [[ -f apps/web/package-lock.json ]]; then \
@@ -212,16 +214,16 @@ demo-connected: bootstrap ## Run the fail-fast DataHub/OpenAI/GitHub connected p
 	@bash scripts/demo-connected.sh
 
 test-demo: dbt-candidates ## Run PostgreSQL/dbt plus live workflow integration proof.
-	DATARESCUE_POSTGRES_DSN=$(DEMO_POSTGRES_DSN) $(UV) run python scripts/verify-live-workflow.py
+	DATARESCUE_POSTGRES_DSN=$(DEMO_POSTGRES_DSN) $(UV_RUN) python scripts/verify-live-workflow.py
 
 test: ## Run API unit tests, web tests and demo integration tests.
-	$(UV) run pytest
+	$(UV_RUN) pytest
 	$(NPM) --prefix apps/web test
 	$(MAKE) test-demo
 
 lint: ## Run Python and TypeScript static checks.
-	$(UV) run ruff check .
-	$(UV) run mypy apps packages
+	$(UV_RUN) ruff check .
+	$(UV_RUN) mypy apps packages
 	$(NPM) --prefix apps/web run build
 
 build: ## Build the production web bundle.
@@ -237,25 +239,25 @@ demo-clean: ## Delete demo containers and the PostgreSQL volume.
 	$(DEMO_RUNTIME) clean
 
 memory-init: ## Initialize and index repo-scoped semantic memory.
-	$(UV) run python scripts/repo_memory.py init
+	$(UV_RUN) python scripts/repo_memory.py init
 
 memory-sync: ## Incrementally sync curated memory Markdown into the local cache.
-	$(UV) run python scripts/repo_memory.py sync
+	$(UV_RUN) python scripts/repo_memory.py sync
 
 memory-reindex: ## Rebuild this repository's local memory namespace from Markdown.
-	$(UV) run python scripts/repo_memory.py reindex
+	$(UV_RUN) python scripts/repo_memory.py reindex
 
 memory-search: ## Search repo memory (usage: make memory-search QUERY='question').
 	@test -n "$(QUERY)" || { echo "QUERY is required." >&2; exit 2; }
-	$(UV) run python scripts/repo_memory.py search "$(QUERY)"
+	$(UV_RUN) python scripts/repo_memory.py search "$(QUERY)"
 
 memory-doctor: ## Check memory sources, cache, manifest, and stale references.
-	$(UV) run python scripts/repo_memory.py doctor
+	$(UV_RUN) python scripts/repo_memory.py doctor
 
 memory-add: ## Add a curated note; requires CATEGORY, SLUG, TITLE, and SUMMARY.
 	@test -n "$(CATEGORY)" -a -n "$(SLUG)" -a -n "$(TITLE)" -a -n "$(SUMMARY)" || { \
 		echo "CATEGORY, SLUG, TITLE, and SUMMARY are required." >&2; exit 2; \
 	}
-	$(UV) run python scripts/repo_memory.py add --category "$(CATEGORY)" --slug "$(SLUG)" \
+	$(UV_RUN) python scripts/repo_memory.py add --category "$(CATEGORY)" --slug "$(SLUG)" \
 		--title "$(TITLE)" --summary "$(SUMMARY)" --tags "$(TAGS)" \
 		--related-files "$(RELATED_FILES)"

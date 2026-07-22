@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,12 @@ class CandidateExecution(BaseModel):
 
 
 class EvidenceExecutor(Protocol):
+    produces_live_evidence: bool
+
+    def bind_to_checkout(
+        self, *, checkout_root: Path, repository_root: Path
+    ) -> EvidenceExecutor: ...
+
     def execute(
         self, *, case_id: str, proposal: CandidateProposal, context: ContextBundle
     ) -> CandidateExecution: ...
@@ -39,6 +46,14 @@ class ReplayEvidenceExecutor:
     This is visibly labelled replay evidence. It is never represented as a live
     Postgres or dbt invocation.
     """
+
+    produces_live_evidence = False
+
+    def bind_to_checkout(
+        self, *, checkout_root: Path, repository_root: Path
+    ) -> ReplayEvidenceExecutor:
+        del checkout_root, repository_root
+        return self
 
     def execute(
         self, *, case_id: str, proposal: CandidateProposal, context: ContextBundle
@@ -132,6 +147,8 @@ _STATEMENT_TIMEOUT_MS = 60_000
 class PostgresDbtExecutor:
     """Execute an allowlisted candidate in its own Postgres schema and run dbt."""
 
+    produces_live_evidence = True
+
     def __init__(
         self,
         *,
@@ -150,6 +167,46 @@ class PostgresDbtExecutor:
         self.evidence_dir = evidence_dir.resolve() if evidence_dir else None
         self.source_relation = source_relation
         self.baseline_relation = baseline_relation
+
+    def bind_to_checkout(
+        self, *, checkout_root: Path, repository_root: Path
+    ) -> PostgresDbtExecutor:
+        """Clone executor configuration onto an immutable verified worktree."""
+
+        repository = repository_root.resolve()
+        checkout = checkout_root.resolve()
+        try:
+            project_relative = self.dbt_project_dir.relative_to(repository)
+        except ValueError as error:
+            raise ValueError(
+                "Live dbt project must be located inside the configured git repository"
+            ) from error
+        project = (checkout / project_relative).resolve()
+        if checkout != project and checkout not in project.parents:
+            raise ValueError("Verified dbt project resolves outside the isolated worktree")
+        if not project.is_dir():
+            raise ValueError("Verified commit does not contain the configured dbt project")
+
+        try:
+            profiles_relative = self.dbt_profiles_dir.relative_to(repository)
+        except ValueError:
+            profiles = self.dbt_profiles_dir
+        else:
+            profiles = (checkout / profiles_relative).resolve()
+            if checkout != profiles and checkout not in profiles.parents:
+                raise ValueError("dbt profiles resolve outside the isolated worktree")
+            if not profiles.is_dir():
+                raise ValueError("Verified commit does not contain the configured dbt profiles")
+
+        return PostgresDbtExecutor(
+            postgres_dsn=self.postgres_dsn,
+            dbt_project_dir=project,
+            dbt_profiles_dir=profiles,
+            dbt_target=self.dbt_target,
+            evidence_dir=self.evidence_dir,
+            source_relation=self.source_relation,
+            baseline_relation=self.baseline_relation,
+        )
 
     def _connect(self, *, autocommit: bool = False):  # type: ignore[no-untyped-def]
         """Open a bounded psycopg connection.
@@ -389,8 +446,18 @@ class PostgresDbtExecutor:
 
 
 def _candidate_schema(case_id: str, source_field: str) -> str:
-    raw = f"candidate_{case_id}_{source_field}".casefold()
-    normalized = re.sub(r"[^a-z0-9_]+", "_", raw).strip("_")[:63]
+    case_part = re.sub(r"[^a-z0-9_]+", "_", case_id.casefold()).strip("_")
+    source_part = re.sub(r"[^a-z0-9_]+", "_", source_field.casefold()).strip("_")
+    normalized = f"candidate_{case_part}_{source_part}"
+    if len(normalized) > 63:
+        # PostgreSQL truncates identifiers at 63 bytes. Blind truncation can
+        # erase the source-field suffix and make two candidates share a schema,
+        # overwriting evidence. Keep a readable source hint plus a digest of the
+        # complete identity so every long candidate remains distinct.
+        digest = hashlib.sha256(normalized.encode()).hexdigest()[:12]
+        suffix = f"_{source_part[:16]}_{digest}"
+        prefix = normalized[: 63 - len(suffix)].rstrip("_")
+        normalized = f"{prefix}{suffix}"
     return require_identifier(normalized, "candidate schema")
 
 

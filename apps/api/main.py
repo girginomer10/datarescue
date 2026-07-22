@@ -24,9 +24,11 @@ from apps.api.models import (
     SchemaField,
     VerifyDeploymentRequest,
 )
-from apps.api.store import CaseNotFoundError
+from apps.api.store import CaseNotFoundError, EventConflictError
 from apps.api.workflow import DEFAULT_ASSET_URN, AssetNotAllowedError, WorkflowService
 from packages.datahub.actions import DataHubSchemaMCLWatcher, MCLActionResult
+
+SQLITE_MAX_INTEGER = (1 << 63) - 1
 
 
 def create_app(
@@ -72,7 +74,13 @@ def create_app(
         try:
             return await run_in_threadpool(service(request).ingest, event)
         except AssetNotAllowedError as error:
-            raise HTTPException(status_code=403, detail=str(error)) from error
+            raise HTTPException(
+                status_code=403,
+                detail=str(error),
+                headers={"X-DataRescue-Error": "ASSET_OUTSIDE_ALLOWLIST"},
+            ) from error
+        except EventConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.post(
         "/api/v1/events/datahub-mcl",
@@ -83,7 +91,10 @@ def create_app(
         payload: dict[str, object], request: Request
     ) -> MCLActionResult:
         watcher = DataHubSchemaMCLWatcher(service(request).ingest)
-        result = await run_in_threadpool(watcher.handle, payload)
+        try:
+            result = await run_in_threadpool(watcher.handle, payload)
+        except EventConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         if result.status.value == "FAILED":
             raise HTTPException(status_code=422, detail=result.reason)
         return result
@@ -114,8 +125,8 @@ def create_app(
         # Native EventSource reconnects with a Last-Event-ID header (already CORS
         # allow-listed) and no query param, so honor it when `after` is unset;
         # otherwise a dropped follow stream replays every event on reconnect.
-        header_cursor = request.headers.get("last-event-id", "")
-        start = after or (int(header_cursor) if header_cursor.isdigit() else 0)
+        header_cursor = request.headers.get("last-event-id")
+        start = _sse_cursor(after=after, header_cursor=header_cursor)
         # Bound a single follow connection's lifetime so an abandoned or abusive
         # stream cannot poll the threadpool forever; clients reconnect and resume.
         max_follow_ticks = 4800  # ~1 hour at 0.75s per idle tick
@@ -225,6 +236,22 @@ def create_app(
 def _sse(event: CaseEvent) -> str:
     data = json.dumps(event.model_dump(mode="json"), separators=(",", ":"))
     return f"id: {event.sequence}\nevent: {event.event_type.value}\ndata: {data}\n\n"
+
+
+def _sse_cursor(*, after: int, header_cursor: str | None) -> int:
+    if after > SQLITE_MAX_INTEGER:
+        raise HTTPException(status_code=400, detail="SSE cursor exceeds SQLite integer range")
+    if after:
+        return after
+    if header_cursor is None or not header_cursor.strip():
+        return 0
+    try:
+        cursor = int(header_cursor.strip(), 10)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="Invalid Last-Event-ID cursor") from error
+    if not 0 <= cursor <= SQLITE_MAX_INTEGER:
+        raise HTTPException(status_code=400, detail="Invalid Last-Event-ID cursor")
+    return cursor
 
 
 app = create_app()

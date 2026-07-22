@@ -14,12 +14,30 @@ import {
   SqlDiff,
   ValidationLedger,
 } from "../components/case-sections";
-import { DataSourceBanner, ErrorPanel, LoadingPanel, StageRail, StatusBadge, formatDateTime, toneForState } from "../components/common";
+import {
+  DataSourceBanner,
+  ErrorPanel,
+  LoadingPanel,
+  StageRail,
+  StatusBadge,
+  formatDateTime,
+  toneForState,
+  type RefreshFailure,
+} from "../components/common";
 import { fetchCase } from "../lib/api";
 
 export function startCaseRefreshPolling(refresh: () => void, intervalMs = 3_000): () => void {
   const timer = window.setInterval(refresh, intervalMs);
   return () => window.clearInterval(timer);
+}
+
+export function describeCaseRefreshFailure(error: unknown): RefreshFailure | undefined {
+  if (!error) return undefined;
+  const detail = error instanceof Error ? error.message : "The API refresh failed.";
+  return {
+    kind: detail.toLowerCase().includes("not found") ? "not-found" : "unavailable",
+    detail,
+  };
 }
 
 export function CasePage() {
@@ -32,16 +50,23 @@ export function CasePage() {
     enabled: Boolean(caseId),
     retry: false,
   });
+  const refreshFailure = query.data ? describeCaseRefreshFailure(query.error) : undefined;
 
   useEffect(() => {
-    if (!caseId || query.data?.transport !== "api") return undefined;
+    if (
+      !caseId ||
+      query.data?.transport !== "api" ||
+      refreshFailure?.kind === "not-found"
+    ) {
+      return undefined;
+    }
     return startCaseRefreshPolling(() => {
       void Promise.all([
         queryClient.invalidateQueries({ queryKey: ["case", caseId] }),
         queryClient.invalidateQueries({ queryKey: ["cases"] }),
       ]);
     });
-  }, [caseId, query.data?.transport, queryClient]);
+  }, [caseId, query.data?.transport, queryClient, refreshFailure?.kind]);
 
   if (query.isLoading) {
     return (
@@ -69,6 +94,12 @@ export function CasePage() {
   }
 
   const rescueCase = query.data.data;
+  const capturedSnapshot = Boolean(refreshFailure);
+  const evidenceProvenance = capturedSnapshot
+    ? "stale"
+    : query.data.mode === "replay"
+      ? "recorded"
+      : "live";
   const isContained = rescueCase.state === "CONTAINED" || rescueCase.state === "FAILED";
   const prActionAvailable = rescueCase.state === "PR_OPEN" || Boolean(rescueCase.prUrl);
 
@@ -80,20 +111,25 @@ export function CasePage() {
         <span aria-current="page">{rescueCase.id}</span>
       </nav>
 
-      <DataSourceBanner envelope={query.data} />
+      <DataSourceBanner envelope={query.data} refreshFailure={refreshFailure} />
 
       <header className="case-hero">
         <div className="case-hero__identity">
           <div className="case-hero__topline">
             <p className="eyebrow">{rescueCase.eyebrow}</p>
-            <StatusBadge label={rescueCase.stateLabel} tone={toneForState(rescueCase.state)} />
+            <StatusBadge
+              label={capturedSnapshot ? `Captured · ${rescueCase.stateLabel}` : rescueCase.stateLabel}
+              tone={capturedSnapshot ? "warning" : toneForState(rescueCase.state)}
+            />
           </div>
           <h1>{rescueCase.title}</h1>
           <div className="case-meta">
             <span><Shield aria-hidden="true" size={14} /> {rescueCase.severity}</span>
             <span><UserRound aria-hidden="true" size={14} /> Owner · {rescueCase.owner}</span>
-            <span>Incident · {rescueCase.incidentStatus}</span>
-            <time dateTime={rescueCase.updatedAt}>Updated {formatDateTime(rescueCase.updatedAt)}</time>
+            <span>{capturedSnapshot ? "Captured incident" : "Incident"} · {rescueCase.incidentStatus}</span>
+            <time dateTime={rescueCase.updatedAt}>
+              {capturedSnapshot ? "Captured" : "Updated"} {formatDateTime(rescueCase.updatedAt)}
+            </time>
           </div>
           <code className="asset-urn" title={rescueCase.assetUrn}>{rescueCase.assetUrn}</code>
           {rescueCase.affectedPath.length ? (
@@ -113,9 +149,13 @@ export function CasePage() {
             <DecisionSummaryIcon tone={rescueCase.outcomeTone} />
           </div>
           <div className="decision-summary__copy">
-            <p className="eyebrow">POLICY OUTCOME</p>
+            <p className="eyebrow">{capturedSnapshot ? "CAPTURED POLICY OUTCOME" : "POLICY OUTCOME"}</p>
             <h2 id="outcome-heading">{rescueCase.outcomeTitle}</h2>
-            <p>{rescueCase.outcomeDetail}</p>
+            <p>
+              {capturedSnapshot
+                ? "This result belongs to the last successful API snapshot and has not been refreshed."
+                : rescueCase.outcomeDetail}
+            </p>
           </div>
           {prActionAvailable ? (
             <div className="decision-summary__action">
@@ -123,20 +163,28 @@ export function CasePage() {
                 prUrl={rescueCase.prUrl}
                 onUnavailable={() => setAnnouncement("Recorded PR evidence has no live GitHub URL. No action was performed.")}
               />
-              <span><GitPullRequest aria-hidden="true" size={13} /> HUMAN MERGE REQUIRED · INCIDENT REMAINS ACTIVE</span>
+              <span>
+                <GitPullRequest aria-hidden="true" size={13} /> {capturedSnapshot
+                  ? "CAPTURED REVIEW GATE · INCIDENT STATUS REQUIRES REFRESH"
+                  : "HUMAN MERGE REQUIRED · INCIDENT REMAINS ACTIVE"}
+              </span>
             </div>
           ) : null}
         </section>
         <div className="sr-only" aria-live="polite">{announcement}</div>
       </header>
 
-      <IntegrationStrip integrations={rescueCase.integrations} />
-      <StageRail stages={rescueCase.stages} />
+      <IntegrationStrip integrations={rescueCase.integrations} captured={capturedSnapshot} />
+      <StageRail stages={rescueCase.stages} captured={capturedSnapshot} />
       <CandidateMatrix candidates={rescueCase.candidates} />
 
       <div className="case-grid case-grid--context">
-        <LineagePanel nodes={rescueCase.lineageNodes} edges={rescueCase.lineageEdges} />
-        <EvidencePanel evidence={rescueCase.evidence} recorded={query.data.mode === "replay"} />
+        <LineagePanel
+          nodes={rescueCase.lineageNodes}
+          edges={rescueCase.lineageEdges}
+          captured={capturedSnapshot}
+        />
+        <EvidencePanel evidence={rescueCase.evidence} provenance={evidenceProvenance} />
       </div>
 
       <div className="case-grid case-grid--proof">

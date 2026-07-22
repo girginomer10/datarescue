@@ -1,12 +1,44 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
 import { CandidateMatrix } from "../components/case-sections";
 import { DataSourceBanner, StageRail } from "../components/common";
-import { containedReplayCase, validatedReplayCase } from "../data/replay";
+import { containedReplayCase, replayPolicy, validatedReplayCase } from "../data/replay";
 import { fetchCase, fetchCases, fetchPolicy } from "../lib/api";
 import { CasePage, startCaseRefreshPolling } from "../pages/CasePage";
+import { PolicyPage } from "../pages/PolicyPage";
+
+function liveCasePayload(id: string) {
+  return {
+    id,
+    asset_urn: "",
+    state: "PATCH_READY",
+    updated_at: "2026-07-22T10:00:00Z",
+    incident_status: "ACTIVE",
+    context: {
+      owner: "Finance Data",
+      integration: { status: "SUCCEEDED", message: "Live context gathered" },
+    },
+    candidates: [],
+    events: [],
+  };
+}
+
+function renderCasePage(client: QueryClient, caseId: string) {
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter
+        initialEntries={[`/cases/${caseId}`]}
+        future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
+      >
+        <Routes>
+          <Route path="/cases/:caseId" element={<CasePage />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
 
 describe("Forensic Console evidence behavior", () => {
   it("keeps technical execution separate from the final policy decision", () => {
@@ -75,6 +107,70 @@ describe("Forensic Console evidence behavior", () => {
     expect(screen.queryByText(/Live API unavailable/i)).not.toBeInTheDocument();
   });
 
+  it("marks cached case evidence stale when a successful API load cannot be refreshed", async () => {
+    const caseId = "DR-LIVE-REFRESH";
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => liveCasePayload(caseId),
+        } as Response)
+        .mockRejectedValueOnce(new Error("connection reset")),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderCasePage(client, caseId);
+
+    expect(await screen.findByText("LIVE API")).toBeInTheDocument();
+    expect(screen.getByText("Current")).toBeInTheDocument();
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["case", caseId] });
+    });
+
+    expect(await screen.findByText("STALE API SNAPSHOT")).toBeInTheDocument();
+    expect(screen.getByText(/last successful snapshot remains visible for reference and is not live/i)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Captured context evidence" })).toBeInTheDocument();
+    expect(screen.getByText("Captured pass")).toBeInTheDocument();
+    expect(screen.queryByText("Current")).not.toBeInTheDocument();
+    expect(screen.queryByText("Live context gathered")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Live case data returned by DataRescue API/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("LIVE API")).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
+  it("reports a reset or removed case without presenting its cached snapshot as live", async () => {
+    const caseId = "DR-LIVE-RESET";
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          json: async () => liveCasePayload(caseId),
+        } as Response)
+        .mockResolvedValueOnce({ ok: false, status: 404, statusText: "Not Found" } as Response),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderCasePage(client, caseId);
+
+    expect(await screen.findByText("LIVE API")).toBeInTheDocument();
+    expect(screen.getByText("Current")).toBeInTheDocument();
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ["case", caseId] });
+    });
+
+    expect(await screen.findByText("CASE NO LONGER AVAILABLE")).toBeInTheDocument();
+    expect(screen.getByText(/API reported that this case no longer exists/i)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Captured context evidence" })).toBeInTheDocument();
+    expect(screen.getByText("Captured pass")).toBeInTheDocument();
+    expect(screen.queryByText("Current")).not.toBeInTheDocument();
+    expect(screen.queryByText("Live context gathered")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Live case data returned by DataRescue API/i)).not.toBeInTheDocument();
+    expect(screen.queryByText("LIVE API")).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
   it("falls back to the recorded queue only when the API is unavailable", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("offline")));
     const result = await fetchCases();
@@ -84,6 +180,34 @@ describe("Forensic Console evidence behavior", () => {
     expect(result.reason).toContain("offline");
     expect(result.data.map((item) => item.id)).toEqual(["DR-024", "DR-025"]);
     vi.unstubAllGlobals();
+  });
+
+  it("bounds an unavailable queue request before using replay evidence", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn((_input: RequestInfo | URL, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => reject(new DOMException("The operation was aborted", "AbortError")),
+              { once: true },
+            );
+          }),
+        ),
+      );
+
+      const resultPromise = fetchCases();
+      await vi.advanceTimersByTimeAsync(3_500);
+      const result = await resultPromise;
+
+      expect(result.transport).toBe("bundled-replay");
+      expect(result.reason).toBe("API did not respond within 3500 ms");
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("preserves an empty successful API queue instead of substituting replay cases", async () => {
@@ -205,6 +329,48 @@ describe("Forensic Console evidence behavior", () => {
     });
     expect(result.data.outcomeTitle).toBe("SAFE REPAIR VALIDATED");
     expect(result.data.outcomeDetail).toMatch(/GitHub write was not run/i);
+    const lineageNodeIds = new Set(result.data.lineageNodes.map((node) => node.id));
+    expect(
+      result.data.lineageEdges.every(
+        (edge) => lineageNodeIds.has(edge.source) && lineageNodeIds.has(edge.target),
+      ),
+    ).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
+  it("does not mix provided lineage nodes with synthesized fallback edges", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          ...liveCasePayload("DR-PROVIDED-LINEAGE"),
+          asset_urn:
+            "urn:li:dataset:(urn:li:dataPlatform:postgres,datarescue.raw.payments_raw,PROD)",
+          context: {
+            owner: "Finance Data",
+            lineage_urns: [
+              "urn:li:dataset:(urn:li:dataPlatform:dbt,datarescue.analytics.fct_revenue,PROD)",
+            ],
+            lineage_current: true,
+            integration: { status: "SUCCEEDED", message: "Live context gathered" },
+          },
+          lineage_nodes: [
+            {
+              id: "provided-source",
+              label: "payments_raw",
+              kind: "Changed dataset",
+              status: "affected",
+              owner: "Finance Data",
+            },
+          ],
+        }),
+      } as Response),
+    );
+
+    const result = await fetchCase("DR-PROVIDED-LINEAGE");
+    expect(result.data.lineageNodes.map((node) => node.id)).toEqual(["provided-source"]);
+    expect(result.data.lineageEdges).toEqual([]);
     vi.unstubAllGlobals();
   });
 
@@ -288,5 +454,27 @@ describe("Forensic Console evidence behavior", () => {
       "≤ 0.50%",
     );
     vi.unstubAllGlobals();
+  });
+
+  it("gives every policy region the accessible name declared by aria-labelledby", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
+    });
+    client.setQueryData(["policy"], {
+      data: replayPolicy,
+      mode: "replay",
+      transport: "hosted-replay",
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <PolicyPage />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("region", { name: "Required evidence gates" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Hard stops" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Automation boundary" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "policy.yaml" })).toBeInTheDocument();
   });
 });

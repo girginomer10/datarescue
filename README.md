@@ -25,7 +25,7 @@ The hosted replay is credential-free and remains explicitly labeled as recorded 
 Requirements:
 
 - A running Docker engine (Docker Desktop, Colima, or equivalent)
-- Python 3.11+ and [uv](https://docs.astral.sh/uv/)
+- [uv](https://docs.astral.sh/uv/) (the repository pins and provisions Python 3.11)
 - Node.js 22+
 
 ```bash

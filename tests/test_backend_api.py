@@ -200,6 +200,16 @@ class _FailingWritebackMCP:
         )
 
 
+class _SuccessfulMCP(_FailingWritebackMCP):
+    def write_evidence_report(self, **kwargs: object) -> IntegrationResult:
+        del kwargs
+        return IntegrationResult(
+            status=IntegrationStatus.SUCCEEDED,
+            operation="test_write_evidence",
+            message="evidence written",
+        )
+
+
 class _ConnectedCandidates:
     def propose(
         self, event: object, context: ContextBundle
@@ -285,9 +295,19 @@ def test_incident_resolves_only_after_post_deploy_verification(tmp_path: Path) -
 
 
 class _CountingExecutor:
+    produces_live_evidence = True
+
     def __init__(self) -> None:
         self.delegate = ReplayEvidenceExecutor()
         self.calls: list[str] = []
+        self.verified_checkouts: list[Path] = []
+
+    def bind_to_checkout(
+        self, *, checkout_root: Path, repository_root: Path
+    ) -> _CountingExecutor:
+        del repository_root
+        self.verified_checkouts.append(checkout_root)
+        return self
 
     def execute(
         self, *, case_id: str, proposal: CandidateProposal, context: ContextBundle
@@ -303,6 +323,7 @@ def test_live_post_deploy_ignores_caller_evidence_and_recomputes(
     executor = _CountingExecutor()
     workflow = WorkflowService(
         settings,
+        mcp=_SuccessfulMCP(),  # type: ignore[arg-type]
         github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
         executor=executor,  # type: ignore[arg-type]
     )
@@ -316,7 +337,14 @@ def test_live_post_deploy_ignores_caller_evidence_and_recomputes(
         command: list[str], **kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         del kwargs
-        stdout = merged_model if command[1] == "show" else ""
+        if command[1] == "show":
+            stdout = merged_model
+        elif command[1:4] == ["remote", "get-url", "origin"]:
+            stdout = "git@github.com:girginomer10/datarescue.git\n"
+        elif command[1] == "rev-parse":
+            stdout = "a" * 40 + "\n"
+        else:
+            stdout = ""
         return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_git)
@@ -344,6 +372,7 @@ def test_live_post_deploy_ignores_caller_evidence_and_recomputes(
     recovered = response.json()
     assert recovered["state"] == "RESOLVED"
     assert executor.calls == ["gross_amount", "net_amount", "net_amount"]
+    assert len(executor.verified_checkouts) == 1
     deployed = next(
         event for event in recovered["events"] if event["event_type"] == "DEPLOYMENT_RECORDED"
     )

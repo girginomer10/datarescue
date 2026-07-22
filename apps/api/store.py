@@ -22,7 +22,7 @@ from apps.api.models import (
     SchemaChangeEvent,
     utc_now,
 )
-from apps.api.state_machine import validate_transition
+from apps.api.state_machine import InvalidStateTransition, validate_transition
 
 
 class CaseNotFoundError(LookupError):
@@ -32,6 +32,15 @@ class CaseNotFoundError(LookupError):
 class DuplicateEventError(RuntimeError):
     def __init__(self, case_id: str) -> None:
         super().__init__(f"Schema event already belongs to case {case_id}")
+        self.case_id = case_id
+
+
+class EventConflictError(RuntimeError):
+    def __init__(self, event_id: str, case_id: str) -> None:
+        super().__init__(
+            f"Event id {event_id!r} is already bound to different content in case {case_id}"
+        )
+        self.event_id = event_id
         self.case_id = case_id
 
 
@@ -127,7 +136,45 @@ class EventStore:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             scope = self._current_scope(connection)
+            existing_by_id = connection.execute(
+                """
+                SELECT case_id, event_type, state, payload_json, dedup_key
+                FROM events
+                WHERE event_id = ? AND reset_scope = ?
+                """,
+                (event_id, scope),
+            ).fetchone()
+            if existing_by_id:
+                if self._stored_event_matches(
+                    existing_by_id,
+                    case_id=case_id,
+                    event_type=event_type,
+                    state=state,
+                    serialized_payload=serialized,
+                    dedup_key=dedup_key,
+                ):
+                    raise DuplicateEventError(str(existing_by_id["case_id"]))
+                raise EventConflictError(event_id, str(existing_by_id["case_id"]))
+            if dedup_key is not None:
+                existing_by_dedup = connection.execute(
+                    """
+                    SELECT case_id FROM events
+                    WHERE dedup_key = ? AND reset_scope = ?
+                    """,
+                    (dedup_key, scope),
+                ).fetchone()
+                if existing_by_dedup:
+                    raise DuplicateEventError(str(existing_by_dedup["case_id"]))
             current = self._current_state(connection, case_id, scope)
+            if event_type is EventType.SCHEMA_CHANGE_DETECTED and current is not None:
+                # A case stream has exactly one detection event. BEGIN IMMEDIATE
+                # serializes this check across API processes, so two different
+                # dedup keys that race on the same short display id cannot be
+                # appended to one case merely because DETECTED -> DETECTED is an
+                # otherwise valid same-state event.
+                raise InvalidStateTransition(
+                    f"Case id {case_id} is already assigned to another schema event"
+                )
             validate_transition(current, state)
             try:
                 cursor = connection.execute(
@@ -149,10 +196,30 @@ class EventStore:
                     ),
                 )
             except sqlite3.IntegrityError as error:
-                # Either unique index — (dedup_key, reset_scope) or
-                # (event_id, reset_scope) — can raise. Both mean an idempotent
-                # duplicate of an existing case, never a crash: resolve to that
-                # case instead of leaking a raw IntegrityError as a 500.
+                # A second process can win either unique index after the checks
+                # above. Re-read the conflicting row and preserve the same
+                # duplicate-vs-conflict semantics instead of leaking SQLite.
+                existing_by_id = connection.execute(
+                    """
+                    SELECT case_id, event_type, state, payload_json, dedup_key
+                    FROM events
+                    WHERE event_id = ? AND reset_scope = ?
+                    """,
+                    (event_id, scope),
+                ).fetchone()
+                if existing_by_id:
+                    if self._stored_event_matches(
+                        existing_by_id,
+                        case_id=case_id,
+                        event_type=event_type,
+                        state=state,
+                        serialized_payload=serialized,
+                        dedup_key=dedup_key,
+                    ):
+                        raise DuplicateEventError(str(existing_by_id["case_id"])) from error
+                    raise EventConflictError(
+                        event_id, str(existing_by_id["case_id"])
+                    ) from error
                 if dedup_key is not None:
                     existing = connection.execute(
                         "SELECT case_id FROM events WHERE dedup_key = ? AND reset_scope = ?",
@@ -160,12 +227,6 @@ class EventStore:
                     ).fetchone()
                     if existing:
                         raise DuplicateEventError(str(existing["case_id"])) from error
-                existing_by_id = connection.execute(
-                    "SELECT case_id FROM events WHERE event_id = ? AND reset_scope = ?",
-                    (event_id, scope),
-                ).fetchone()
-                if existing_by_id:
-                    raise DuplicateEventError(str(existing_by_id["case_id"])) from error
                 raise
             connection.execute("COMMIT")
             if cursor.lastrowid is None:
@@ -179,6 +240,60 @@ class EventStore:
                 payload=payload,
                 created_at=created_at,
             )
+
+    def find_case_for_event_id(
+        self,
+        event_id: str,
+        *,
+        case_id: str,
+        event_type: EventType,
+        state: CaseState,
+        payload: dict[str, Any],
+        dedup_key: str | None,
+    ) -> str | None:
+        """Return an equivalent event's case or reject conflicting ID reuse."""
+
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        with self._connect() as connection:
+            scope = self._current_scope(connection)
+            existing = connection.execute(
+                """
+                SELECT case_id, event_type, state, payload_json, dedup_key
+                FROM events
+                WHERE event_id = ? AND reset_scope = ?
+                """,
+                (event_id, scope),
+            ).fetchone()
+        if existing is None:
+            return None
+        if self._stored_event_matches(
+            existing,
+            case_id=case_id,
+            event_type=event_type,
+            state=state,
+            serialized_payload=serialized,
+            dedup_key=dedup_key,
+        ):
+            return str(existing["case_id"])
+        raise EventConflictError(event_id, str(existing["case_id"]))
+
+    @staticmethod
+    def _stored_event_matches(
+        existing: sqlite3.Row,
+        *,
+        case_id: str,
+        event_type: EventType,
+        state: CaseState,
+        serialized_payload: str,
+        dedup_key: str | None,
+    ) -> bool:
+        return (
+            str(existing["case_id"]) == case_id
+            and str(existing["event_type"]) == event_type.value
+            and str(existing["state"]) == state.value
+            and existing["dedup_key"] == dedup_key
+            and _same_event_payload(str(existing["payload_json"]), serialized_payload)
+        )
 
     def reset(self, reason: str = "Demo reset requested") -> int:
         created_at = utc_now()
@@ -216,6 +331,15 @@ class EventStore:
                 (dedup_key, scope),
             ).fetchone()
         return str(row["case_id"]) if row else None
+
+    def case_id_exists(self, case_id: str) -> bool:
+        with self._connect() as connection:
+            scope = self._current_scope(connection)
+            row = connection.execute(
+                "SELECT 1 FROM events WHERE case_id = ? AND sequence > ? LIMIT 1",
+                (case_id, scope),
+            ).fetchone()
+        return row is not None
 
     def events_for_case(self, case_id: str, after_sequence: int = 0) -> list[CaseEvent]:
         with self._connect() as connection:
@@ -288,6 +412,38 @@ def _replace_assessment(
     assessments: list[CandidateAssessment], selected: CandidateAssessment
 ) -> list[CandidateAssessment]:
     return [selected if assessment.id == selected.id else assessment for assessment in assessments]
+
+
+def _same_event_payload(existing: str, incoming: str) -> bool:
+    if existing == incoming:
+        return True
+    try:
+        existing_payload = json.loads(existing)
+        incoming_payload = json.loads(incoming)
+    except json.JSONDecodeError:
+        return False
+    # `observed_at` is server-generated when callers omit it. Two otherwise
+    # identical schema-change requests with the same event id remain idempotent;
+    # source, schema, asset, and every other payload field must still match.
+    for payload in (existing_payload, incoming_payload):
+        if not isinstance(payload, dict):
+            return False
+        schema_change = payload.get("schema_change")
+        if isinstance(schema_change, dict):
+            schema_change.pop("observed_at", None)
+            entity_urn = schema_change.get("entity_urn")
+            if isinstance(entity_urn, str):
+                schema_change["entity_urn"] = entity_urn.casefold()
+            for field_list_name in ("before_fields", "after_fields"):
+                fields = schema_change.get(field_list_name)
+                if isinstance(fields, list):
+                    schema_change[field_list_name] = sorted(
+                        fields,
+                        key=lambda field: json.dumps(
+                            field, sort_keys=True, separators=(",", ":")
+                        ),
+                    )
+    return bool(existing_payload == incoming_payload)
 
 
 def project_case(events: Iterable[CaseEvent]) -> CaseSnapshot:

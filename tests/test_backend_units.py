@@ -813,9 +813,9 @@ def test_reset_is_serialized_under_the_worker_lock(tmp_path: Path) -> None:
     assert isinstance(captured["sequence"], int)
 
 
-def test_append_treats_event_id_collision_as_a_duplicate(tmp_path: Path) -> None:
+def test_append_rejects_event_id_reuse_with_conflicting_content(tmp_path: Path) -> None:
     from apps.api.models import EventType
-    from apps.api.store import DuplicateEventError, EventStore
+    from apps.api.store import EventConflictError, EventStore
 
     store = EventStore(tmp_path / "state.sqlite3")
     payload = {"schema_change": {}, "incident_urn": "urn:li:dataRescueIncident:DR-A"}
@@ -828,9 +828,9 @@ def test_append_treats_event_id_collision_as_a_duplicate(tmp_path: Path) -> None
         event_id="shared-event-id",
     )
 
-    # A different case body reusing the same event_id trips the (event_id,
-    # reset_scope) index; it must surface as a duplicate, not a raw 500.
-    with pytest.raises(DuplicateEventError) as excinfo:
+    # An event id is idempotent only when all normalized event content matches.
+    # Reusing it for another case is a conflict, never a silent duplicate.
+    with pytest.raises(EventConflictError) as excinfo:
         store.append(
             case_id="DR-B",
             event_type=EventType.SCHEMA_CHANGE_DETECTED,
@@ -840,3 +840,16 @@ def test_append_treats_event_id_collision_as_a_duplicate(tmp_path: Path) -> None
             event_id="shared-event-id",
         )
     assert excinfo.value.case_id == "DR-A"
+
+
+def test_long_case_ids_keep_candidate_schemas_distinct() -> None:
+    case_id = f"DR-{'A' * 64}"
+
+    gross = _candidate_schema(case_id, "gross_amount")
+    net = _candidate_schema(case_id, "net_amount")
+
+    assert len(gross) <= 63
+    assert len(net) <= 63
+    assert gross != net
+    assert "gross_amount" in gross
+    assert "net_amount" in net

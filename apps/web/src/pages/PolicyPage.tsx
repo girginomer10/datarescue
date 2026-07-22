@@ -33,6 +33,7 @@ export function PolicyPage() {
         <SectionHeading
           eyebrow="PASS / FAIL THRESHOLDS"
           title="Required evidence gates"
+          titleId="policy-rules-title"
           detail="Unknown or stale evidence fails closed; it never counts as a pass."
         />
         <div className="policy-rule-grid">
@@ -52,13 +53,13 @@ export function PolicyPage() {
 
       <div className="policy-grid">
         <section className="panel hard-stop-panel" aria-labelledby="hard-stops-title">
-          <SectionHeading eyebrow="NON-NEGOTIABLE" title="Hard stops" detail="Any one condition refuses auto-repair." />
+          <SectionHeading eyebrow="NON-NEGOTIABLE" title="Hard stops" titleId="hard-stops-title" detail="Any one condition refuses auto-repair." />
           <ul>
             {policy.hardStops.map((item) => <li key={item}><Ban aria-hidden="true" size={16} /><span>{item}</span></li>)}
           </ul>
         </section>
         <section className="panel boundary-panel" aria-labelledby="boundary-title">
-          <SectionHeading eyebrow="HUMAN AUTHORITY" title="Automation boundary" detail="Proof enables review; it does not replace approval." />
+          <SectionHeading eyebrow="HUMAN AUTHORITY" title="Automation boundary" titleId="boundary-title" detail="Proof enables review; it does not replace approval." />
           <ul>
             {policy.automationBoundary.map((item) => <li key={item}><LockKeyhole aria-hidden="true" size={16} /><span>{item}</span></li>)}
           </ul>
@@ -66,7 +67,7 @@ export function PolicyPage() {
       </div>
 
       <section className="panel yaml-panel" aria-labelledby="yaml-title">
-        <SectionHeading eyebrow="SOURCE OF TRUTH" title="policy.yaml" detail="Read-only policy loaded by the backend worker." action={<span className="read-only-label"><Check aria-hidden="true" size={13} /> READ ONLY</span>} />
+        <SectionHeading eyebrow="SOURCE OF TRUTH" title="policy.yaml" titleId="yaml-title" detail="Read-only policy loaded by the backend worker." action={<span className="read-only-label"><Check aria-hidden="true" size={13} /> READ ONLY</span>} />
         <pre><Code2 aria-hidden="true" size={16} /><code>{policy.yaml}</code></pre>
       </section>
     </main>

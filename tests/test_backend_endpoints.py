@@ -194,8 +194,19 @@ def test_policy_endpoint_exposes_the_seven_gate_thresholds(tmp_path: Path) -> No
         response = client.get("/api/v1/policy")
     assert response.status_code == 200
     policy = response.json()
+    assert set(policy) == {
+        "semantic_evidence_required",
+        "max_total_variance_pct",
+        "max_row_count_variance_pct",
+        "min_primary_key_overlap_pct",
+        "max_null_rate_delta_percentage_points",
+        "dbt_build_required",
+        "lineage_must_be_current",
+    }
     assert policy["max_total_variance_pct"] == 0.50
+    assert policy["max_row_count_variance_pct"] == 0.10
     assert policy["min_primary_key_overlap_pct"] == 99.90
+    assert policy["max_null_rate_delta_percentage_points"] == 0.50
     assert policy["semantic_evidence_required"] is True
     assert policy["dbt_build_required"] is True
     assert policy["lineage_must_be_current"] is True

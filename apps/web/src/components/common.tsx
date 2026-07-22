@@ -51,7 +51,36 @@ export function StatusBadge({ label, tone }: { label: string; tone: Tone }) {
   );
 }
 
-export function DataSourceBanner<T>({ envelope }: { envelope: ApiEnvelope<T> }) {
+export interface RefreshFailure {
+  kind: "not-found" | "unavailable";
+  detail: string;
+}
+
+export function DataSourceBanner<T>({
+  envelope,
+  refreshFailure,
+}: {
+  envelope: ApiEnvelope<T>;
+  refreshFailure?: RefreshFailure;
+}) {
+  if (refreshFailure) {
+    const removed = refreshFailure.kind === "not-found";
+    const message = removed
+      ? `The API reported that this case no longer exists — ${refreshFailure.detail}`
+      : `Refreshing this case failed — ${refreshFailure.detail}`;
+    return (
+      <div className="source-banner source-banner--replay" role="status" aria-live="polite">
+        <CloudOff aria-hidden="true" size={16} />
+        <div>
+          <strong>{removed ? "CASE NO LONGER AVAILABLE" : "STALE API SNAPSHOT"}</strong>
+          <span>
+            {message} The last successful snapshot remains visible for reference and is not live.
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   if (envelope.mode === "live") {
     return (
       <div className="source-banner source-banner--live" role="status">
@@ -105,9 +134,12 @@ export function SectionHeading({
   );
 }
 
-export function StageRail({ stages }: { stages: Stage[] }) {
+export function StageRail({ stages, captured = false }: { stages: Stage[]; captured?: boolean }) {
   return (
-    <nav className="stage-rail-wrap" aria-label="Recovery progress">
+    <nav
+      className="stage-rail-wrap"
+      aria-label={captured ? "Captured recovery progress" : "Recovery progress"}
+    >
       <ol className="stage-rail">
         {stages.map((stage, index) => {
           const Icon = stage.status === "complete" ? Check : stage.status === "blocked" ? X : undefined;
@@ -115,7 +147,11 @@ export function StageRail({ stages }: { stages: Stage[] }) {
             <li
               className={`stage stage--${stage.status}`}
               key={stage.id}
-              aria-current={stage.status === "current" || stage.status === "blocked" ? "step" : undefined}
+              aria-current={
+                !captured && (stage.status === "current" || stage.status === "blocked")
+                  ? "step"
+                  : undefined
+              }
             >
               <div className="stage__rule" aria-hidden="true" />
               <span className="stage__node" aria-hidden="true">
@@ -124,14 +160,22 @@ export function StageRail({ stages }: { stages: Stage[] }) {
               <span className="stage__copy">
                 <strong>{stage.label}</strong>
                 <span>
-                  {stage.timestamp ??
-                    (stage.status === "complete"
-                      ? "Complete"
+                  {captured
+                    ? stage.status === "complete"
+                      ? "Captured complete"
                       : stage.status === "blocked"
-                        ? "Blocked"
+                        ? "Captured blocked"
                         : stage.status === "future"
-                          ? "Pending"
-                          : "In progress")}
+                          ? "Captured pending"
+                          : "Captured state"
+                    : stage.timestamp ??
+                      (stage.status === "complete"
+                        ? "Complete"
+                        : stage.status === "blocked"
+                          ? "Blocked"
+                          : stage.status === "future"
+                            ? "Pending"
+                            : "In progress")}
                 </span>
               </span>
             </li>

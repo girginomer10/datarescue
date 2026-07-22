@@ -41,6 +41,10 @@ class EventSink(Protocol):
     def __call__(self, event: SchemaChangeEvent) -> Any: ...
 
 
+class HTTPAssetOutOfScopeError(PermissionError):
+    """A machine-labelled allowlist rejection from the DataRescue API."""
+
+
 class DataHubSchemaMCLWatcher:
     """Filter DataHub MCLs and enqueue only real dataset schema transitions."""
 
@@ -101,6 +105,19 @@ class DataHubSchemaMCLWatcher:
                 status=MCLActionStatus.SKIPPED,
                 reason="Asset is outside the remediation allowlist",
             )
+        except httpx.HTTPStatusError as error:
+            return MCLActionResult(
+                status=MCLActionStatus.FAILED,
+                reason=(
+                    "DataRescue API rejected the schema event with HTTP "
+                    f"{error.response.status_code}"
+                ),
+            )
+        except httpx.RequestError as error:
+            return MCLActionResult(
+                status=MCLActionStatus.FAILED,
+                reason=f"DataRescue API delivery failed: {type(error).__name__}",
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             return MCLActionResult(
                 status=MCLActionStatus.FAILED,
@@ -131,6 +148,10 @@ class HTTPEventSink:
     def __call__(self, event: SchemaChangeEvent) -> Any:
         with httpx.Client(timeout=self.timeout_seconds, transport=self.transport) as client:
             response = client.post(self.url, json=event.model_dump(mode="json"))
+            if _is_api_allowlist_rejection(response):
+                raise HTTPAssetOutOfScopeError(
+                    "DataRescue API rejected an asset outside its allowlist"
+                )
             response.raise_for_status()
             body = response.json()
         return _HTTPWorkflowResponse(body)
@@ -141,6 +162,22 @@ class _HTTPWorkflowResponse:
         case = body.get("case", {})
         self.case = type("CaseRef", (), {"id": case.get("id")})()
         self.deduplicated = body.get("deduplicated")
+
+
+def _is_api_allowlist_rejection(response: httpx.Response) -> bool:
+    if (
+        response.status_code != 403
+        or response.headers.get("x-datarescue-error") != "ASSET_OUTSIDE_ALLOWLIST"
+    ):
+        return False
+    try:
+        body = response.json()
+    except json.JSONDecodeError:
+        return False
+    detail = body.get("detail") if isinstance(body, Mapping) else None
+    return isinstance(detail, str) and detail.startswith(
+        "Asset is outside the configured remediation allowlist"
+    )
 
 
 class DataRescueSchemaAction(_DataHubActionBase):  # type: ignore[misc]
