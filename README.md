@@ -6,6 +6,11 @@ DataRescue is an evidence-gated runtime recovery agent for DataHub and dbt. It d
 
 The demo is intentionally adversarial: both candidate mappings compile, but `gross_amount AS revenue` is rejected because it conflicts with the business glossary and changes recognized revenue by **+3.40%**. `net_amount AS revenue` is selected only after semantic, reconciliation, and dbt checks pass.
 
+- [Open the hosted, hash-verified evidence replay](https://girginomer10.github.io/datarescue/)
+- [Inspect the application-generated draft PR](https://github.com/girginomer10/datarescue/pull/1)
+
+The hosted replay is credential-free and remains explicitly labeled as recorded evidence. The linked draft PR is separate live proof of the GitHub write path; it remains open for human review and is not presented as recovery.
+
 ## What makes it different
 
 - Runs candidate repairs in isolated PostgreSQL schemas instead of trusting generated code.
