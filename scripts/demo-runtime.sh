@@ -96,9 +96,25 @@ postgres_up() {
 }
 
 postgres_wait() {
+  local container_logs=""
   for _attempt in $(seq 1 30); do
+    # The official image briefly exposes its temporary initialization server.
+    # Do not accept that transient pg_isready success: wait until entrypoint
+    # initialization has completed (or was skipped for an existing volume),
+    # then prove the initialized fixture is reachable on the final server.
+    container_logs="$(docker logs "${POSTGRES_CONTAINER}" 2>&1 || true)"
+    if ! grep -Eq \
+      'PostgreSQL init process complete; ready for start up|Skipping initialization' \
+      <<<"${container_logs}"; then
+      sleep 1
+      continue
+    fi
     if docker exec "${POSTGRES_CONTAINER}" \
-      pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1; then
+      pg_isready -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" >/dev/null 2>&1 && \
+      [[ "$(docker exec "${POSTGRES_CONTAINER}" psql -X -A -t \
+        -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" \
+        -c "SELECT CASE WHEN to_regclass('audit.payments_fct_last_good') IS NOT NULL THEN 1 ELSE 0 END" \
+        2>/dev/null | tr -d '[:space:]')" == "1" ]]; then
       echo "PostgreSQL is ready."
       return
     fi

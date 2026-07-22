@@ -31,3 +31,11 @@
 - Verified: Memory source security scan, incremental index, completion-query retrieval, stale-reference doctor, Python lint, and repository diff checks.
 - Memory: The active completion note is the authoritative resume order; the local vector cache is rebuildable and remains outside Git.
 - Next: Start with Docker Compose v2 plus the real DataHub MCL-to-incident path, then live MCP/GraphQL/OpenAI, merge-SHA closure, connected containment, fresh-clone demo, genuine replay, video, and Devpost.
+
+## 2026-07-22 - Codex (fresh-run PostgreSQL readiness fix)
+
+- Task: Fixed the GitHub-hosted dbt proof race exposed by the memory-checkpoint push.
+- Changed: `scripts/demo-runtime.sh` now waits past PostgreSQL's temporary entrypoint initialization server and proves the initialized audit fixture exists before declaring readiness. Added a durable bugfix memory note.
+- Verified: Shell syntax, Ruff, local `make test-demo`, memory sync, and memory doctor passed. The replacement fresh GitHub runner remains the final regression proof.
+- Memory: Added `memory/bugfixes/postgres-entrypoint-readiness-race.md`; do not replace final-server readiness with a single `pg_isready` probe.
+- Next: Push the readiness fix and require both GitHub `quality` and `postgres-dbt-proof` to pass.
