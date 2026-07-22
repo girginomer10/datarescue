@@ -23,3 +23,11 @@
 - Verified: `main` CI and Pages passed; the hosted replay returned HTTP 200 and rendered `RECORDED_REPLAY EVIDENCE`; PR #1 is open/draft, changes one file, and passed `quality` plus `postgres-dbt-proof`. Case `DR-996C48F0` remained `PR_OPEN` with an active local incident after PR creation.
 - Memory: None; release evidence is captured in this handoff and the external GitHub checks.
 - Next: Do not merge PR #1 automatically. A human merge must be followed by `verify-deployment`. Full DataHub Core/Kafka/MCP/GraphQL execution is still `NOT_RUN` because that connected stack and its credentials were unavailable on this machine.
+
+## 2026-07-22 - Codex (persistent completion checkpoint)
+
+- Task: Persisted the exact remaining definition of done so a later `devam et` resumes from the live DataHub gap instead of treating the MVP as complete.
+- Changed: Added repo-scoped semantic-memory sources, offline SQLite indexing/search/doctor tooling, future-agent instructions, and `memory/decisions/datarescue-hackathon-definition-of-done.md`.
+- Verified: Memory source security scan, incremental index, completion-query retrieval, stale-reference doctor, Python lint, and repository diff checks.
+- Memory: The active completion note is the authoritative resume order; the local vector cache is rebuildable and remains outside Git.
+- Next: Start with Docker Compose v2 plus the real DataHub MCL-to-incident path, then live MCP/GraphQL/OpenAI, merge-SHA closure, connected containment, fresh-clone demo, genuine replay, video, and Devpost.

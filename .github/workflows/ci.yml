@@ -43,6 +43,12 @@ jobs:
       - name: Backend tests
         run: uv run pytest
 
+      - name: Verify repo semantic memory
+        run: |
+          uv run python scripts/repo_memory.py reindex
+          uv run python scripts/repo_memory.py doctor
+          uv run python scripts/repo_memory.py search "How should Codex use repo semantic memory?" --top-k 1
+
       - name: Verify recorded replay evidence
         run: python scripts/verify-replay.py
 

@@ -43,7 +43,7 @@ DEMO_POSTGRES_DSN := postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGR
 	datahub-ingest-dbt datahub-ingest datahub-up datahub-down datahub-seed-healthy \
 	datahub-apply-drift datahub-validate datahub-actions-validate datahub-actions-run \
 	demo-ready dev demo demo-replay demo-connected test-demo test lint build check \
-	clean demo-clean
+	clean demo-clean memory-init memory-sync memory-reindex memory-search memory-doctor memory-add
 
 help: ## Show available commands.
 	@awk 'BEGIN {FS = ":.*## "; printf "DataRescue commands:\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-25s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -235,3 +235,27 @@ clean: ## Remove dbt build artifacts only.
 demo-clean: ## Delete demo containers and the PostgreSQL volume.
 	@echo "Deleting the DataRescue demo database volume."
 	$(DEMO_RUNTIME) clean
+
+memory-init: ## Initialize and index repo-scoped semantic memory.
+	$(UV) run python scripts/repo_memory.py init
+
+memory-sync: ## Incrementally sync curated memory Markdown into the local cache.
+	$(UV) run python scripts/repo_memory.py sync
+
+memory-reindex: ## Rebuild this repository's local memory namespace from Markdown.
+	$(UV) run python scripts/repo_memory.py reindex
+
+memory-search: ## Search repo memory (usage: make memory-search QUERY='question').
+	@test -n "$(QUERY)" || { echo "QUERY is required." >&2; exit 2; }
+	$(UV) run python scripts/repo_memory.py search "$(QUERY)"
+
+memory-doctor: ## Check memory sources, cache, manifest, and stale references.
+	$(UV) run python scripts/repo_memory.py doctor
+
+memory-add: ## Add a curated note; requires CATEGORY, SLUG, TITLE, and SUMMARY.
+	@test -n "$(CATEGORY)" -a -n "$(SLUG)" -a -n "$(TITLE)" -a -n "$(SUMMARY)" || { \
+		echo "CATEGORY, SLUG, TITLE, and SUMMARY are required." >&2; exit 2; \
+	}
+	$(UV) run python scripts/repo_memory.py add --category "$(CATEGORY)" --slug "$(SLUG)" \
+		--title "$(TITLE)" --summary "$(SUMMARY)" --tags "$(TAGS)" \
+		--related-files "$(RELATED_FILES)"

@@ -157,6 +157,7 @@ The reviewed Case Detail composition is available on the
 - [Devpost submission copy](docs/devpost-submission.md)
 - [Recorded evidence package](demo/replay/README.md)
 - [DataHub integration guide](demo/datahub/README.md)
+- [Completion definition and resume order](memory/decisions/datarescue-hackathon-definition-of-done.md)
 
 ## License
 
