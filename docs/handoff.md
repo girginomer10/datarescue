@@ -36,6 +36,6 @@
 
 - Task: Fixed the GitHub-hosted dbt proof race exposed by the memory-checkpoint push.
 - Changed: `scripts/demo-runtime.sh` now waits past PostgreSQL's temporary entrypoint initialization server and proves the initialized audit fixture exists before declaring readiness. Added a durable bugfix memory note.
-- Verified: Shell syntax, Ruff, local `make test-demo`, memory sync, and memory doctor passed. The replacement fresh GitHub runner remains the final regression proof.
+- Verified: Shell syntax, Ruff, local `make test-demo`, memory sync, and memory doctor passed. Fresh GitHub run `29929649811` then passed both `quality` and `postgres-dbt-proof`; Pages run `29929650837` also passed.
 - Memory: Added `memory/bugfixes/postgres-entrypoint-readiness-race.md`; do not replace final-server readiness with a single `pg_isready` probe.
-- Next: Push the readiness fix and require both GitHub `quality` and `postgres-dbt-proof` to pass.
+- Next: Resume the completion roadmap at the real DataHub MCL-to-incident path; do not expand UI scope first.
