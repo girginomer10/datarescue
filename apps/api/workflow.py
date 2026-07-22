@@ -363,6 +363,18 @@ class WorkflowService:
             build = execution.build
             evidence_mode = "LIVE_RECOMPUTED"
         else:
+            if (
+                case.incident_integration is not None
+                and case.incident_integration.status is IntegrationStatus.SUCCEEDED
+            ):
+                # A live DataHub incident must never be resolved on caller-supplied
+                # metrics and an unverified commit SHA. Recomputation (git merge
+                # verification + fresh evidence) requires execution_mode=postgres;
+                # refuse rather than trust request-provided numbers.
+                raise ValueError(
+                    "Resolving a live incident requires postgres execution mode "
+                    "to recompute post-deploy evidence"
+                )
             semantic_verdict = request.semantic_verdict
             reconciliation = request.reconciliation
             build = request.build

@@ -71,11 +71,19 @@
     resilience, slugified incident-state class.
   - Docs: fixed the shared-recipe platform_instance claim in architecture.md
     and documented the untracked DATARESCUE_ settings in .env.example.
+- Also closed the highest-severity finding defensively: post-deploy
+  verification now refuses (409) to resolve a *live* (SUCCEEDED) DataHub
+  incident from caller-supplied metrics; a live incident can only be resolved
+  in postgres mode, which recomputes evidence and verifies the merge SHA. This
+  changes no supported flow (demo/replay incidents are NOT_CONFIGURED; the
+  connected launcher runs in postgres mode) but removes the forged-recovery
+  path that a github-writes-on + replay-execution misconfiguration exposed.
 - Deliberately NOT changed (design-level / user-infra-dependent, documented for
-  a human decision): adding API authentication; the replay-mode post-deploy
-  trust model (postgres mode already recomputes and verifies the merge SHA);
+  a human decision): a full API authentication layer (the app is a local demo
+  behind CORS; production deployment should sit behind an auth gateway);
   replacing the free-text semantic-verdict substring match with a structured
-  glossary-term binding.
+  glossary-term binding (the six other independent gates still block a wrong
+  repair, so a fooled semantic gate cannot ship one).
 - Memory: added `memory/bugfixes/workflow-writer-serialization.md`.
 - Next: the connected vertical slice (real DataHub Core/Kafka/MCP/GraphQL +
   live OpenAI + human merge) remains the outstanding completion gate.

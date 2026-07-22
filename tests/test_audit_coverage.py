@@ -448,6 +448,41 @@ def _good_verify_body() -> dict[str, object]:
     }
 
 
+def _patched_model() -> str:
+    return STG_MODEL.read_text(encoding="utf-8").replace(
+        'env_var("DATARESCUE_REVENUE_COLUMN", "amount")',
+        'env_var("DATARESCUE_REVENUE_COLUMN", "net_amount")',
+    )
+
+
+def _fake_git_show(model: str):  # type: ignore[no-untyped-def]
+    def fake_git(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        stdout = model if command[1] == "show" else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    return fake_git
+
+
+def test_replay_mode_refuses_to_resolve_a_live_incident(tmp_path: Path) -> None:
+    # A live (SUCCEEDED) DataHub incident must not be resolved on caller evidence;
+    # only postgres mode, which recomputes from the merge, may resolve it.
+    settings = make_test_settings(tmp_path)
+    workflow = WorkflowService(
+        settings,
+        incidents=_SuccessfulIncidents(),  # type: ignore[arg-type]
+        mcp=_ValidContextMCP(),  # type: ignore[arg-type]
+        github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
+    )
+    with TestClient(create_app(settings, workflow)) as client:
+        case = client.post("/api/v1/demo/drift", json={}).json()["case"]
+        assert case["state"] == "PR_OPEN"
+        response = client.post(
+            f"/api/v1/cases/{case['id']}/verify-deployment", json=_good_verify_body()
+        )
+        assert response.status_code == 409
+        assert client.get(f"/api/v1/cases/{case['id']}").json()["state"] == "PR_OPEN"
+
+
 def test_ingest_records_a_durable_non_leaking_failed_event(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     model_dir = repo / "demo/dbt/models/staging"
@@ -466,14 +501,20 @@ def test_ingest_records_a_durable_non_leaking_failed_event(tmp_path: Path) -> No
     assert str(repo) not in failed["payload"]["message"]
 
 
-def test_post_deploy_writeback_failure_keeps_incident_active(tmp_path: Path) -> None:
-    settings = make_test_settings(tmp_path)
+def test_post_deploy_writeback_failure_keeps_incident_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Postgres mode recomputes from the (faked) merge, passes the gates, then the
+    # final RECOVERED write-back fails: the case must go FAILED, incident ACTIVE.
+    settings = make_test_settings(tmp_path, execution_mode="postgres")
     workflow = WorkflowService(
         settings,
         incidents=_SuccessfulIncidents(),  # type: ignore[arg-type]
         mcp=_WritebackFailsOnRecovered(),  # type: ignore[arg-type]
         github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
+        executor=ReplayEvidenceExecutor(),  # type: ignore[arg-type]
     )
+    monkeypatch.setattr(subprocess, "run", _fake_git_show(_patched_model()))
     with TestClient(create_app(settings, workflow)) as client:
         case = client.post("/api/v1/demo/drift", json={}).json()["case"]
         assert case["state"] == "PR_OPEN"
@@ -485,14 +526,18 @@ def test_post_deploy_writeback_failure_keeps_incident_active(tmp_path: Path) -> 
     assert "INCIDENT_RESOLVED" not in [event["event_type"] for event in recovered["events"]]
 
 
-def test_post_deploy_resolution_failure_keeps_incident_active(tmp_path: Path) -> None:
-    settings = make_test_settings(tmp_path)
+def test_post_deploy_resolution_failure_keeps_incident_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_test_settings(tmp_path, execution_mode="postgres")
     workflow = WorkflowService(
         settings,
         incidents=_ResolveFailsIncidents(),  # type: ignore[arg-type]
         mcp=_ValidContextMCP(),  # type: ignore[arg-type]
         github=_SuccessfulDraftPR(),  # type: ignore[arg-type]
+        executor=ReplayEvidenceExecutor(),  # type: ignore[arg-type]
     )
+    monkeypatch.setattr(subprocess, "run", _fake_git_show(_patched_model()))
     with TestClient(create_app(settings, workflow)) as client:
         case = client.post("/api/v1/demo/drift", json={}).json()["case"]
         assert case["state"] == "PR_OPEN"
