@@ -103,6 +103,44 @@ def test_fail_closed_branches_are_reachable_from_every_active_state(
     validate_transition(state, CaseState.FAILED)
 
 
+def test_every_allowed_forward_transition_is_accepted() -> None:
+    # Deleting a legal pipeline edge would silently break the workflow.
+    for current, targets in ALLOWED_TRANSITIONS.items():
+        for target in targets:
+            validate_transition(current, target)
+
+
+@pytest.mark.parametrize(
+    ("current", "target"),
+    [
+        (CaseState.DEPLOYED, CaseState.VALIDATING),
+        (CaseState.POST_DEPLOY_VERIFIED, CaseState.PATCH_READY),
+        (CaseState.PATCH_READY, CaseState.DETECTED),
+    ],
+)
+def test_backward_and_skip_transitions_are_rejected(
+    current: CaseState, target: CaseState
+) -> None:
+    with pytest.raises(InvalidStateTransition):
+        validate_transition(current, target)
+
+
+def test_dedup_key_is_stable_across_field_order_and_urn_case() -> None:
+    from apps.api.workflow import schema_event_dedup_key
+
+    a = SchemaChangeEvent(
+        entity_urn="URN:LI:X",
+        before_fields=[SchemaField(name="a"), SchemaField(name="b")],
+        after_fields=[SchemaField(name="c")],
+    )
+    b = SchemaChangeEvent(
+        entity_urn="urn:li:x",
+        before_fields=[SchemaField(name="b"), SchemaField(name="a")],
+        after_fields=[SchemaField(name="c")],
+    )
+    assert schema_event_dedup_key(a) == schema_event_dedup_key(b)
+
+
 # --------------------------------------------------------------------------- #
 # Request contracts
 # --------------------------------------------------------------------------- #
@@ -369,6 +407,69 @@ def test_mcp_write_evidence_tags_degraded_and_returns_written_urn() -> None:
     assert captured[0]["tags"] == ["datarescue:degraded"]
 
 
+def test_mcp_parses_content_text_json_and_degrades_prose() -> None:
+    def json_text(body: dict[str, object]) -> httpx.Response:
+        payload = json.dumps({"owner": "Finance"})
+        return httpx.Response(
+            200,
+            json={"result": {"content": [{"type": "text", "text": payload}]}},
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(json_text))
+    )
+    assert adapter.fetch_context("urn:x").context == {"owner": "Finance"}
+
+    def prose_text(body: dict[str, object]) -> httpx.Response:
+        return httpx.Response(
+            200, json={"result": {"content": [{"type": "text", "text": "just prose"}]}}
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(prose_text))
+    )
+    assert adapter.fetch_context("urn:x").context == {"text": "just prose"}
+
+
+def test_mcp_event_stream_returns_the_last_message() -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        stream = (
+            'data: {"jsonrpc":"2.0","method":"progress"}\n\n'
+            'data: {"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"owner":"Last"}}}\n\n'
+        )
+        return httpx.Response(200, text=stream, headers={"content-type": "text/event-stream"})
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(call))
+    )
+    assert adapter.fetch_context("urn:x").context == {"owner": "Last"}
+
+
+def test_mcp_empty_event_stream_is_failed() -> None:
+    def call(body: dict[str, object]) -> httpx.Response:
+        return httpx.Response(
+            200, text="event: ping\n\n", headers={"content-type": "text/event-stream"}
+        )
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(_mcp_handshake(call))
+    )
+    assert adapter.fetch_context("urn:x").integration.status is IntegrationStatus.FAILED
+
+
+def test_mcp_initialize_error_is_failed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("method") == "initialize":
+            return httpx.Response(200, json={"error": {"message": "handshake refused"}})
+        return httpx.Response(202)
+
+    adapter = DataHubMCPAdapter(
+        endpoint="https://mcp.test/rpc", transport=httpx.MockTransport(handler)
+    )
+    assert adapter.fetch_context("urn:x").integration.status is IntegrationStatus.FAILED
+
+
 # --------------------------------------------------------------------------- #
 # DataHub GraphQL adapter
 # --------------------------------------------------------------------------- #
@@ -500,6 +601,52 @@ def test_http_event_sink_posts_and_reads_case_reference() -> None:
     )
     assert response.case.id == "DR-1"
     assert response.deduplicated is False
+
+
+def test_watcher_skips_identical_schema_rewrite() -> None:
+    captured: list[SchemaChangeEvent] = []
+    watcher = DataHubSchemaMCLWatcher(captured.append)
+    same = json.dumps({"fields": [{"fieldPath": "payment_id"}, {"fieldPath": "amount"}]})
+    payload = {
+        "entityType": "dataset",
+        "aspectName": "schemaMetadata",
+        "entityUrn": "urn:li:dataset:x",
+        "previousAspectValue": {"contentType": "application/json", "value": same},
+        "aspect": {"contentType": "application/json", "value": same},
+    }
+    result = watcher.handle(payload)
+    assert result.status is MCLActionStatus.SKIPPED
+    assert captured == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("aspectName", "ownership"),
+        ("entityType", "dashboard"),
+        ("event_type", "EntityChangeEvent_v1"),
+    ],
+)
+def test_watcher_skips_non_schema_signals(key: str, value: str) -> None:
+    payload = _drift_mcl()
+    payload[key] = value
+    result = DataHubSchemaMCLWatcher(lambda event: None).handle(payload)
+    assert result.status is MCLActionStatus.SKIPPED
+
+
+def test_watcher_fails_on_unsupported_content_type_and_missing_fields() -> None:
+    avro = _drift_mcl()
+    avro["aspect"] = {"contentType": "application/avro", "value": "..."}
+    assert (
+        DataHubSchemaMCLWatcher(lambda event: None).handle(avro).status
+        is MCLActionStatus.FAILED
+    )
+    no_fields = _drift_mcl()
+    no_fields["aspect"] = {"contentType": "application/json", "value": json.dumps({"nope": []})}
+    assert (
+        DataHubSchemaMCLWatcher(lambda event: None).handle(no_fields).status
+        is MCLActionStatus.FAILED
+    )
 
 
 # --------------------------------------------------------------------------- #
