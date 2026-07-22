@@ -4,7 +4,7 @@
   The default preserves the healthy pre-drift model and is the line patched by
   the draft recovery PR after net_amount is proven safe.
 #}
-{% set revenue_column = env_var("DATARESCUE_REVENUE_COLUMN", "amount") %}
+{% set revenue_column = env_var("DATARESCUE_REVENUE_COLUMN", "net_amount") %}
 {% set allowed_revenue_columns = ["amount", "gross_amount", "net_amount", "settlement_amount"] %}
 
 {% if revenue_column not in allowed_revenue_columns %}
