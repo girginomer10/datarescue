@@ -217,6 +217,27 @@ class _RaisingExecutor:
         raise RuntimeError("postgres unavailable")
 
 
+def test_case_id_prefix_collision_is_handled_as_a_duplicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import apps.api.workflow as workflow_module
+
+    settings = make_test_settings(tmp_path)
+    workflow = WorkflowService(settings)
+    # Force two distinct drifts to collide on the same derived case id.
+    monkeypatch.setattr(workflow_module, "case_id_from_dedup", lambda dedup_key: "DR-COLLIDE")
+    with TestClient(create_app(settings, workflow)) as client:
+        first = client.post("/api/v1/demo/drift", json={}).json()
+        assert first["case"]["state"] == "PATCH_READY"  # advanced past DETECTED
+        # A different drift (different dedup key) that maps to the same case id
+        # must not escape as a 500.
+        response = client.post("/api/v1/demo/drift", json={"scenario": "fail-closed"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deduplicated"] is True
+    assert body["case"]["id"] == "DR-COLLIDE"
+
+
 def test_executor_failure_fails_closed_to_rejected(tmp_path: Path) -> None:
     settings = make_test_settings(tmp_path)
     workflow = WorkflowService(settings, executor=_RaisingExecutor())  # type: ignore[arg-type]

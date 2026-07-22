@@ -26,6 +26,7 @@ from apps.api.models import (
     SemanticVerdict,
     VerifyDeploymentRequest,
 )
+from apps.api.state_machine import InvalidStateTransition
 from apps.api.store import DuplicateEventError, EventStore
 from packages.datahub.graphql import DataHubGraphQLAdapter
 from packages.datahub.mcp import DataHubMCPAdapter
@@ -133,6 +134,13 @@ class WorkflowService:
             except DuplicateEventError as duplicate:
                 return SchemaChangeResponse(
                     case=self.store.get_case(duplicate.case_id), deduplicated=True
+                )
+            except InvalidStateTransition:
+                # An 8-hex case-id prefix collision with a case that has already
+                # advanced past DETECTED is astronomically rare; treat it as a
+                # duplicate rather than letting it escape as an HTTP 500.
+                return SchemaChangeResponse(
+                    case=self.store.get_case(case_id), deduplicated=True
                 )
             try:
                 self._advance(case_id=case_id, event=event)
